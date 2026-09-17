@@ -1,7 +1,3 @@
-// Package cloudsigma authenticates against a CloudSigma-compatible API that
-// enforces 2FA (T-Mobile T-Cloud). HTTP Basic is rejected on such accounts, so
-// the only way in is the browser flow: login, verify_otp, then ride the
-// session cookie.
 package cloudsigma
 
 import (
