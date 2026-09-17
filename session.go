@@ -54,8 +54,9 @@ var (
 )
 
 // Login performs the login + verify_otp handshake and returns an http.Client
-// whose requests carry the verified session. baseURL is host and path without
-// a scheme, e.g. "prg1.t-cloud.eu/api/2.0/".
+// whose requests carry the verified session and transparently re-authenticate
+// if the session expires. baseURL is host and path without a scheme, e.g.
+// "prg1.t-cloud.eu/api/2.0/".
 //
 // Sessions are cached per credential set. The provider is muxed, so both
 // servers configure independently, and the API rejects a TOTP code that has
@@ -69,7 +70,49 @@ func Login(ctx context.Context, baseURL, username, password, otpSecret, imperson
 		return cached, nil
 	}
 
-	root := "https://" + strings.TrimSuffix(baseURL, "/") + "/"
+	auth, err := newAuthenticator(baseURL, username, password, otpSecret, impersonate, userAgent, 60*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	refresher := newRefresher(auth)
+	if err := refresher.refresh(ctx, refresher.currentGeneration()); err != nil {
+		return nil, err
+	}
+
+	client := &http.Client{Jar: auth.jar, Timeout: auth.timeout, Transport: refresher.transport()}
+	sessionCache[key] = client
+
+	return client, nil
+}
+
+// authenticator owns one credential set, its cookie jar and the handshake that
+// turns a username/password/TOTP triple into a session. It is deliberately
+// transport-free: the handshake runs on a bare http.Client so a 401 during
+// login can never re-enter the refreshing transport and recurse.
+type authenticator struct {
+	root     string
+	origin   string
+	apiURL   *url.URL
+	jar      http.CookieJar
+	timeout  time.Duration
+	username string
+	password string
+	otp      string
+
+	impersonate string
+	userAgent   string
+
+	sleep func(context.Context, time.Duration) error
+	now   func() time.Time
+}
+
+func newAuthenticator(baseURL, username, password, otpSecret, impersonate, userAgent string, timeout time.Duration) (*authenticator, error) {
+	root := baseURL
+	if !strings.Contains(root, "://") {
+		root = "https://" + strings.TrimSuffix(root, "/") + "/"
+	}
+	root = strings.TrimSuffix(root, "/") + "/"
+
 	u, err := url.Parse(root)
 	if err != nil {
 		return nil, fmt.Errorf("invalid base URL %q: %w", root, err)
@@ -80,101 +123,116 @@ func Login(ctx context.Context, baseURL, username, password, otpSecret, imperson
 	if err != nil {
 		return nil, err
 	}
-	client := &http.Client{Jar: jar, Timeout: 60 * time.Second}
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
 
-	body, _ := json.Marshal(map[string]string{"username": username, "password": password})
-	if _, err := do(ctx, client, root+"accounts/action/?do=login", origin, userAgent, body, nil); err != nil {
-		return nil, fmt.Errorf("login failed: %w", err)
+	return &authenticator{
+		root:        root,
+		origin:      origin,
+		apiURL:      u,
+		jar:         jar,
+		timeout:     timeout,
+		username:    username,
+		password:    password,
+		otp:         otpSecret,
+		impersonate: impersonate,
+		userAgent:   userAgent,
+		sleep:       realSleep,
+		now:         time.Now,
+	}, nil
+}
+
+func (a *authenticator) handshake(ctx context.Context) error {
+	client := &http.Client{Jar: a.jar, Timeout: a.timeout}
+
+	body, _ := json.Marshal(map[string]string{"username": a.username, "password": a.password})
+	if _, err := a.doJSON(ctx, client, http.MethodPost, a.root+"accounts/action/?do=login", body, nil); err != nil {
+		return fmt.Errorf("login failed: %w", err)
 	}
 
 	verify := func() error {
-		otp, err := TOTP(otpSecret, time.Now())
+		otp, err := TOTP(a.otp, a.now())
 		if err != nil {
 			return err
 		}
-		headers := map[string]string{"OTP": otp, "X-CSRFToken": csrf(jar, u)}
-		_, err = do(ctx, client, root+"accounts/action/?do=verify_otp", origin, userAgent, []byte("{}"), headers)
+		headers := map[string]string{"OTP": otp, "X-CSRFToken": csrf(a.jar, a.apiURL)}
+		_, err = a.doJSON(ctx, client, http.MethodPost, a.root+"accounts/action/?do=verify_otp", []byte("{}"), headers)
 		return err
 	}
 
-	err = verify()
-	var failed *statusError
-	if errors.As(err, &failed) && failed.code == http.StatusUnauthorized {
+	err := verify()
+	var failed *APIError
+	if errors.As(err, &failed) && failed.StatusCode == http.StatusUnauthorized {
 		// Terraform runs a fresh provider process for the apply walk, so a
 		// plan and an apply seconds apart present the same code twice and the
 		// API rejects the second as a replay. The next window is a new code.
 		//
 		// ponytail: costs up to 30s per collision. If that grates, cache the
 		// session cookie on disk instead of re-authenticating per process.
-		if waitErr := waitForNextWindow(ctx); waitErr != nil {
-			return nil, waitErr
+		if waitErr := a.waitForNextWindow(ctx); waitErr != nil {
+			return waitErr
 		}
 		err = verify()
 	}
 	if err != nil {
-		return nil, fmt.Errorf("OTP verification failed: %w", err)
+		return fmt.Errorf("OTP verification failed: %w", err)
 	}
 
-	client.Transport = sessionTransport{jar: jar, origin: origin}
-
-	// Impersonation is a GET that mutates the session: subsequent requests act
-	// as the target user. Must run through sessionTransport so it carries CSRF.
-	if impersonate != "" {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, root+"impersonate/"+impersonate+"/", nil)
+	if a.impersonate != "" {
+		// Impersonation is a GET that mutates the session: subsequent requests
+		// act as the target user. It is unsafe, so it carries CSRF.
+		headers := map[string]string{"X-CSRFToken": csrf(a.jar, a.apiURL)}
+		req, err := a.newRequest(ctx, http.MethodGet, a.root+"impersonate/"+a.impersonate+"/", nil, headers)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		resp, err := client.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("impersonation failed: %w", err)
+			return fmt.Errorf("impersonation failed: %w", err)
 		}
 		_ = resp.Body.Close()
 		if resp.StatusCode < 200 || resp.StatusCode > 299 {
-			return nil, fmt.Errorf("impersonation failed: %s", resp.Status)
+			return fmt.Errorf("impersonation failed: %s", resp.Status)
 		}
 	}
 
-	sessionCache[key] = client
-
-	return client, nil
+	return nil
 }
 
 // waitForNextWindow blocks until the current TOTP code has expired.
-func waitForNextWindow(ctx context.Context) error {
-	next := time.Unix((time.Now().Unix()/30+1)*30+1, 0)
+func (a *authenticator) waitForNextWindow(ctx context.Context) error {
+	next := time.Unix((a.now().Unix()/30+1)*30+1, 0)
+	return a.sleep(ctx, time.Until(next))
+}
 
-	timer := time.NewTimer(time.Until(next))
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
+func (a *authenticator) newRequest(ctx context.Context, method, url string, body []byte, headers map[string]string) (*http.Request, error) {
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
 	}
-}
-
-type statusError struct {
-	code int
-	body string
-}
-
-func (e *statusError) Error() string {
-	return fmt.Sprintf("%d: %s", e.code, e.body)
-}
-
-func do(ctx context.Context, c *http.Client, url, origin, userAgent string, body []byte, headers map[string]string) ([]byte, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(ctx, method, url, reader)
 	if err != nil {
 		return nil, err
 	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Referer", origin)
-	request.Header.Set("User-Agent", userAgent)
+	if body != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	request.Header.Set("Referer", a.origin)
+	request.Header.Set("User-Agent", a.userAgent)
 	for k, v := range headers {
 		request.Header.Set(k, v)
 	}
+	return request, nil
+}
 
-	response, err := c.Do(request)
+func (a *authenticator) doJSON(ctx context.Context, client *http.Client, method, url string, body []byte, headers map[string]string) ([]byte, error) {
+	request, err := a.newRequest(ctx, method, url, body, headers)
+	if err != nil {
+		return nil, err
+	}
+
+	response, err := client.Do(request)
 	if err != nil {
 		return nil, err
 	}
@@ -182,18 +240,122 @@ func do(ctx context.Context, c *http.Client, url, origin, userAgent string, body
 
 	payload, _ := io.ReadAll(io.LimitReader(response.Body, 1<<16))
 	if response.StatusCode < 200 || response.StatusCode > 299 {
-		return nil, &statusError{code: response.StatusCode, body: strings.TrimSpace(string(payload))}
+		return nil, &APIError{
+			StatusCode: response.StatusCode,
+			Body:       strings.TrimSpace(string(payload)),
+			Method:     method,
+			URL:        url,
+		}
 	}
 	return payload, nil
 }
 
-func csrf(jar http.CookieJar, u *url.URL) string {
-	for _, cookie := range jar.Cookies(u) {
-		if cookie.Name == "csrftoken" {
-			return cookie.Value
+// refresher turns "the session is gone" into at most one in-flight login. The
+// generation counter lets a request whose 401 raced with a completed refresh
+// skip a redundant second login and retry against the new session instead.
+type refresher struct {
+	auth        *authenticator
+	maxAttempts int
+	baseDelay   time.Duration
+	maxDelay    time.Duration
+
+	mu         sync.Mutex
+	generation uint64
+	inFlight   chan struct{}
+	lastErr    error
+}
+
+func newRefresher(auth *authenticator) *refresher {
+	return &refresher{
+		auth:        auth,
+		maxAttempts: 4,
+		baseDelay:   time.Second,
+		maxDelay:    10 * time.Second,
+	}
+}
+
+func (r *refresher) currentGeneration() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.generation
+}
+
+// refresh re-authenticates once. seen is the generation the caller observed
+// before sending its request; when it no longer matches, a concurrent refresh
+// already fixed the session and the caller should just retry. Callers sharing
+// the same generation block on a single handshake.
+func (r *refresher) refresh(ctx context.Context, seen uint64) error {
+	r.mu.Lock()
+	if r.generation != seen {
+		r.mu.Unlock()
+		return nil
+	}
+	if r.inFlight != nil {
+		done := r.inFlight
+		r.mu.Unlock()
+		select {
+		case <-done:
+			r.mu.Lock()
+			err := r.lastErr
+			r.mu.Unlock()
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
-	return ""
+	done := make(chan struct{})
+	r.inFlight = done
+	r.mu.Unlock()
+
+	err := r.login(ctx)
+
+	r.mu.Lock()
+	r.lastErr = err
+	if err == nil {
+		r.generation++
+	}
+	r.inFlight = nil
+	close(done)
+	r.mu.Unlock()
+
+	return err
+}
+
+// login retries only a rate-limited handshake, with bounded exponential
+// backoff, and gives up after maxAttempts so a rejected credential fails fast
+// instead of looping forever.
+func (r *refresher) login(ctx context.Context) error {
+	var err error
+	for attempt := 0; attempt < r.maxAttempts; attempt++ {
+		err = r.auth.handshake(ctx)
+		if err == nil {
+			return nil
+		}
+		if !isRateLimited(err) || attempt == r.maxAttempts-1 {
+			return err
+		}
+		if sleepErr := r.auth.sleep(ctx, r.backoff(attempt)); sleepErr != nil {
+			return sleepErr
+		}
+	}
+	return err
+}
+
+func (r *refresher) backoff(attempt int) time.Duration {
+	delay := r.baseDelay << attempt
+	if delay <= 0 || delay > r.maxDelay {
+		delay = r.maxDelay
+	}
+	return delay
+}
+
+func (r *refresher) transport() http.RoundTripper {
+	return &refreshTransport{
+		base:       sessionTransport{jar: r.auth.jar, origin: r.auth.origin},
+		jar:        r.auth.jar,
+		refresh:    r.refresh,
+		generation: r.currentGeneration,
+	}
 }
 
 // sessionTransport swaps the SDK's HTTP Basic credentials for the session
@@ -211,4 +373,130 @@ func (t sessionTransport) RoundTrip(request *http.Request) (*http.Response, erro
 		request.Header.Set("X-CSRFToken", token)
 	}
 	return http.DefaultTransport.RoundTrip(request)
+}
+
+// refreshTransport watches for session loss, re-logs-in through the shared
+// single-flight refresher, and replays the buffered body exactly once. It never
+// touches non-session failures, so a 5xx passes through for the caller (CSI)
+// to retry.
+type refreshTransport struct {
+	base       http.RoundTripper
+	jar        http.CookieJar
+	refresh    func(context.Context, uint64) error
+	generation func() uint64
+}
+
+func (t *refreshTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	body, err := bufferBody(request)
+	if err != nil {
+		return nil, err
+	}
+
+	generation := t.generation()
+	response, err := t.attempt(request, body)
+	if err != nil || !isSessionLoss(response) {
+		return response, err
+	}
+
+	closeBody(response)
+	if err := t.refresh(request.Context(), generation); err != nil {
+		return nil, err
+	}
+	return t.attempt(request, body)
+}
+
+func (t *refreshTransport) attempt(request *http.Request, body []byte) (*http.Response, error) {
+	clone := request.Clone(request.Context())
+	if body != nil {
+		clone.Body = io.NopCloser(bytes.NewReader(body))
+		clone.ContentLength = int64(len(body))
+	}
+	// The client's jar added cookies before RoundTrip ran; on a retry those are
+	// stale, so rebuild them from the (possibly just refreshed) jar.
+	if t.jar != nil {
+		clone.Header.Del("Cookie")
+		for _, cookie := range t.jar.Cookies(clone.URL) {
+			clone.AddCookie(cookie)
+		}
+	}
+	return t.base.RoundTrip(clone)
+}
+
+func bufferBody(request *http.Request) ([]byte, error) {
+	if request.Body == nil || request.Body == http.NoBody {
+		return nil, nil
+	}
+	payload, err := io.ReadAll(request.Body)
+	if err != nil {
+		return nil, err
+	}
+	_ = request.Body.Close()
+	request.Body = io.NopCloser(bytes.NewReader(payload))
+	return payload, nil
+}
+
+func closeBody(response *http.Response) {
+	if response == nil || response.Body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<16))
+	_ = response.Body.Close()
+}
+
+// isSessionLoss reports whether a response means the session is no longer
+// valid: an explicit 401, or the login-page redirect the API uses for an
+// unauthenticated session. It is checked in RoundTrip, before the client's
+// redirect policy can follow that redirect.
+func isSessionLoss(response *http.Response) bool {
+	if response == nil {
+		return false
+	}
+	if response.StatusCode == http.StatusUnauthorized {
+		return true
+	}
+	if response.StatusCode < 300 || response.StatusCode > 399 {
+		return false
+	}
+	return isLoginRedirect(response.Header.Get("Location"))
+}
+
+func isLoginRedirect(location string) bool {
+	return strings.Contains(strings.ToLower(location), "login")
+}
+
+func isRateLimited(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	if apiErr.StatusCode == http.StatusTooManyRequests {
+		return true
+	}
+	body := strings.ToLower(apiErr.Body)
+	return strings.Contains(body, "too many") ||
+		strings.Contains(body, "wait a minute") ||
+		strings.Contains(body, "rate limit")
+}
+
+func csrf(jar http.CookieJar, u *url.URL) string {
+	for _, cookie := range jar.Cookies(u) {
+		if cookie.Name == "csrftoken" {
+			return cookie.Value
+		}
+	}
+	return ""
+}
+
+func realSleep(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
