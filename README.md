@@ -9,9 +9,10 @@ It implements the browser flow required by CloudSigma accounts that enforce
 - `Login(ctx, baseURL, username, password, otpSecret, impersonate, userAgent)` —
   performs `login` + `verify_otp` and returns an `*http.Client` that carries the
   verified session cookie (and CSRF header).
-- `New(Config)` — performs the same handshake and returns a `*Client` with typed
-  JSON helpers (`Get`/`Post`/`Put`/`Delete`). Unlike `Login` it does **not**
-  cache, so a long-running controller (CSI driver) gets its own session.
+- `New(ctx, Config)` — performs the same handshake under `ctx` and returns a
+  `*Client` with typed JSON helpers (`Get`/`Post`/`Put`/`Delete`). Unlike
+  `Login` it does **not** cache, so a long-running controller (CSI driver) gets
+  its own session.
 - `TOTP(secret, t)` — RFC 6238 TOTP codes for the `verify_otp` step.
 - `Endpoint(baseURL, location)` — resolves the API host and path (no scheme),
   falling back to the `<location>.cloudsigma.com` endpoint.
@@ -39,6 +40,19 @@ handshake and replays the original request exactly once:
 - Rate-limited re-login ("too many failed authentication attempts") backs off
   with bounded exponential delays and gives up after a capped number of
   attempts, so bad credentials fail fast.
+- A refresh cycle that ends in error is remembered for a 30s cooldown: further
+  session-loss responses at the same generation fail fast with the remembered
+  error instead of starting another full handshake cycle. A refresh that sees a
+  newer generation (another goroutine already succeeded) still returns
+  immediately.
+- If session loss persists after the single retry, `RoundTrip` returns an
+  `*APIError` (real status, body, method and URL) instead of the response, so a
+  login redirect can never reach the HTTP client's redirect logic. `Client.do`
+  unwraps that error so callers get the same typed shape as an ordinary non-2xx
+  response.
+- Response bodies are capped at 8 MiB. An oversized body fails with
+  `ErrResponseTooLarge` (test with `errors.Is`) rather than being silently
+  truncated and mis-reported as a JSON error.
 - The handshake itself runs on a bare client that shares the cookie jar, so a
   `401` during login can never re-enter the refreshing transport.
 
@@ -70,7 +84,7 @@ type drive struct {
 func main() {
 	ctx := context.Background()
 
-	client, err := csgo.New(csgo.Config{
+	client, err := csgo.New(ctx, csgo.Config{
 		BaseURL:   "prg1.t-cloud.eu/api/2.0/", // host + path, no scheme
 		Username:  "user@example.com",
 		Password:  "secret-password",

@@ -24,6 +24,7 @@ type fakeAPI struct {
 	verifyCalls    int
 	protectedCalls int
 	writeCalls     int
+	loginPageHits  int
 	counter        int
 
 	session string
@@ -48,7 +49,11 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 	mux.HandleFunc("/api/2.0/accounts/action/", f.handleAccount)
 	mux.HandleFunc("/api/2.0/protected/", f.handleProtected)
 	mux.HandleFunc("/api/2.0/status/", f.handleStatus)
+	mux.HandleFunc("/api/2.0/blob/", f.handleBlob)
 	mux.HandleFunc("/accounts/login/", func(w http.ResponseWriter, _ *http.Request) {
+		f.mu.Lock()
+		f.loginPageHits++
+		f.mu.Unlock()
 		_, _ = io.WriteString(w, "<html>login</html>")
 	})
 	f.srv = httptest.NewServer(mux)
@@ -145,6 +150,25 @@ func (f *fakeAPI) handleStatus(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, `{"status":%d}`, code)
 }
 
+func (f *fakeAPI) handleBlob(w http.ResponseWriter, r *http.Request) {
+	size, err := strconv.Atoi(r.URL.Query().Get("size"))
+	if err != nil || size < 0 {
+		http.Error(w, "bad size", http.StatusBadRequest)
+		return
+	}
+	const prefix = `{"ok":true}`
+	if size < len(prefix) {
+		size = len(prefix)
+	}
+	body := make([]byte, size)
+	copy(body, prefix)
+	for i := len(prefix); i < size; i++ {
+		body[i] = ' '
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(body)
+}
+
 func (f *fakeAPI) expire() {
 	f.mu.Lock()
 	f.session = ""
@@ -155,6 +179,12 @@ func (f *fakeAPI) counts() (login, verify, protected int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.loginCalls, f.verifyCalls, f.protectedCalls
+}
+
+func (f *fakeAPI) loginPageCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.loginPageHits
 }
 
 func (f *fakeAPI) observations() (verifyOTPs, verifyCSRFs, writeCSRFs []string, writeBodies [][]byte, csrf string) {
@@ -169,7 +199,7 @@ func (f *fakeAPI) observations() (verifyOTPs, verifyCSRFs, writeCSRFs []string, 
 
 func (f *fakeAPI) newClient(t *testing.T) *Client {
 	t.Helper()
-	client, err := New(Config{
+	client, err := New(context.Background(), Config{
 		BaseURL:   f.baseURL(),
 		Username:  "user@example.com",
 		Password:  "secret-password",
@@ -217,8 +247,48 @@ func TestNewHandshakeHappyPath(t *testing.T) {
 }
 
 func TestNewRequiresBaseURL(t *testing.T) {
-	if _, err := New(Config{}); err == nil {
+	if _, err := New(context.Background(), Config{}); err == nil {
 		t.Fatal("New with empty BaseURL returned nil error")
+	}
+}
+
+func TestNewHonoursContext(t *testing.T) {
+	cases := []struct {
+		name string
+		ctx  func() context.Context
+	}{
+		{"cancelled", func() context.Context {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx
+		}},
+		{"expired deadline", func() context.Context {
+			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			defer cancel()
+			return ctx
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeAPI(t)
+
+			client, err := New(tc.ctx(), Config{
+				BaseURL:   f.baseURL(),
+				Username:  "user@example.com",
+				Password:  "secret-password",
+				OTPSecret: "GEZD GNBV GY3T QOJQ",
+				UserAgent: "cloudsigma-go-test/1.0",
+			})
+			if err == nil {
+				t.Fatal("New returned nil error for a dead context")
+			}
+			if client != nil {
+				t.Error("New returned a usable client for a dead context")
+			}
+			if login, _, _ := f.counts(); login != 0 {
+				t.Errorf("login calls = %d, want 0 (request must not be sent)", login)
+			}
+		})
 	}
 }
 
@@ -336,6 +406,15 @@ func TestRetryHappensExactlyOnce(t *testing.T) {
 	if apiErr.StatusCode != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", apiErr.StatusCode)
 	}
+	if apiErr.Method != http.MethodGet {
+		t.Errorf("Method = %q, want GET", apiErr.Method)
+	}
+	if !strings.Contains(apiErr.URL, "protected") {
+		t.Errorf("URL = %q, want the protected request URL", apiErr.URL)
+	}
+	if apiErr.Body == "" {
+		t.Error("Body is empty, want the upstream response text")
+	}
 
 	login, _, protected := f.counts()
 	if protected != 2 {
@@ -343,6 +422,44 @@ func TestRetryHappensExactlyOnce(t *testing.T) {
 	}
 	if login != 2 {
 		t.Errorf("login calls = %d, want 2 (initial + one refresh, no loop)", login)
+	}
+}
+
+func TestPersistentLoginRedirectIsNotFollowed(t *testing.T) {
+	f := newFakeAPI(t)
+	client := f.newClient(t)
+
+	f.mu.Lock()
+	f.alwaysUnauthorized = true
+	f.redirectUnauthorized = true
+	f.mu.Unlock()
+
+	err := client.Get(context.Background(), "protected/", nil)
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want *APIError", err)
+	}
+	if apiErr.StatusCode < 300 || apiErr.StatusCode > 399 {
+		t.Errorf("status = %d, want a 3xx login redirect", apiErr.StatusCode)
+	}
+	if apiErr.Method != http.MethodGet {
+		t.Errorf("Method = %q, want GET", apiErr.Method)
+	}
+	if !strings.Contains(apiErr.URL, "protected") {
+		t.Errorf("URL = %q, want the protected request URL", apiErr.URL)
+	}
+	if apiErr.Body == "" {
+		t.Error("Body is empty, want the redirect response text")
+	}
+	if hits := f.loginPageCount(); hits != 0 {
+		t.Errorf("login page fetched %d times, want 0", hits)
+	}
+	login, _, protected := f.counts()
+	if protected != 2 {
+		t.Errorf("protected calls = %d, want 2 (no loop)", protected)
+	}
+	if login != 2 {
+		t.Errorf("login calls = %d, want 2 (initial + one refresh)", login)
 	}
 }
 
@@ -369,6 +486,137 @@ func TestServerErrorNotRetried(t *testing.T) {
 	}
 	if login != 1 {
 		t.Errorf("login calls = %d, want 1 (5xx must not trigger re-login)", login)
+	}
+}
+
+func TestResponseTooLargeFailsLoudly(t *testing.T) {
+	f := newFakeAPI(t)
+	client := f.newClient(t)
+
+	err := client.Get(context.Background(), fmt.Sprintf("blob/?size=%d", maxResponseBytes+1), nil)
+	if !errors.Is(err, ErrResponseTooLarge) {
+		t.Fatalf("error = %v, want ErrResponseTooLarge", err)
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		t.Errorf("error = %v, want the overflow sentinel, not *APIError", err)
+	}
+	if !strings.Contains(err.Error(), strconv.Itoa(maxResponseBytes)) {
+		t.Errorf("error = %q, want it to name the %d-byte limit", err, maxResponseBytes)
+	}
+}
+
+func TestResponseAtCapDecodes(t *testing.T) {
+	f := newFakeAPI(t)
+	client := f.newClient(t)
+
+	var out map[string]any
+	if err := client.Get(context.Background(), fmt.Sprintf("blob/?size=%d", maxResponseBytes), &out); err != nil {
+		t.Fatalf("Get at cap: %v", err)
+	}
+	if out["ok"] != true {
+		t.Errorf("response = %v, want ok:true", out)
+	}
+}
+
+func TestReadCapped(t *testing.T) {
+	if got, err := readCapped(strings.NewReader("123"), 5); err != nil || string(got) != "123" {
+		t.Errorf("under limit: got %q, err %v", got, err)
+	}
+	if got, err := readCapped(strings.NewReader("12345"), 5); err != nil || string(got) != "12345" {
+		t.Errorf("at limit: got %q, err %v", got, err)
+	}
+	if _, err := readCapped(strings.NewReader("123456"), 5); !errors.Is(err, ErrResponseTooLarge) {
+		t.Errorf("over limit: err = %v, want ErrResponseTooLarge", err)
+	}
+}
+
+func TestFailedRefreshCooldown(t *testing.T) {
+	f := newFakeAPI(t)
+	f.mu.Lock()
+	f.loginStatus = http.StatusUnauthorized
+	f.loginBody = "bad credentials"
+	f.mu.Unlock()
+
+	auth, err := newAuthenticator(f.baseURL(), "user", "pass", "GEZD GNBV GY3T QOJQ", "", "ua", time.Second)
+	if err != nil {
+		t.Fatalf("newAuthenticator: %v", err)
+	}
+	now := time.Unix(1_700_000_000, 0)
+	auth.now = func() time.Time { return now }
+	auth.sleep = func(context.Context, time.Duration) error { return nil }
+
+	r := newRefresher(auth)
+	gen := r.currentGeneration()
+
+	first := r.refresh(context.Background(), gen)
+	if first == nil {
+		t.Fatal("first refresh = nil, want error")
+	}
+	if login, _, _ := f.counts(); login != 1 {
+		t.Fatalf("login calls = %d, want 1", login)
+	}
+
+	second := r.refresh(context.Background(), gen)
+	if second == nil {
+		t.Fatal("second refresh = nil, want the remembered error")
+	}
+	if second != first {
+		t.Errorf("second refresh = %v, want the remembered %v", second, first)
+	}
+	if login, _, _ := f.counts(); login != 1 {
+		t.Errorf("login calls = %d, want 1 (cooldown must not start a new cycle)", login)
+	}
+
+	now = now.Add(31 * time.Second)
+	third := r.refresh(context.Background(), gen)
+	if third == nil {
+		t.Fatal("third refresh = nil, want a new failing cycle after cooldown")
+	}
+	if login, _, _ := f.counts(); login != 2 {
+		t.Errorf("login calls = %d, want 2 (new cycle after cooldown)", login)
+	}
+}
+
+func TestSuccessfulRefreshShortCircuitsAndClearsCooldown(t *testing.T) {
+	f := newFakeAPI(t)
+	f.mu.Lock()
+	f.loginStatus = http.StatusUnauthorized
+	f.loginBody = "bad credentials"
+	f.mu.Unlock()
+
+	auth, err := newAuthenticator(f.baseURL(), "user", "pass", "GEZD GNBV GY3T QOJQ", "", "ua", time.Second)
+	if err != nil {
+		t.Fatalf("newAuthenticator: %v", err)
+	}
+	now := time.Unix(1_700_000_000, 0)
+	auth.now = func() time.Time { return now }
+	auth.sleep = func(context.Context, time.Duration) error { return nil }
+
+	r := newRefresher(auth)
+	gen := r.currentGeneration()
+	if err := r.refresh(context.Background(), gen); err == nil {
+		t.Fatal("first refresh = nil, want error")
+	}
+
+	now = now.Add(31 * time.Second)
+	f.mu.Lock()
+	f.loginStatus = 0
+	f.loginBody = ""
+	f.mu.Unlock()
+
+	if err := r.refresh(context.Background(), gen); err != nil {
+		t.Fatalf("refresh after cooldown: %v", err)
+	}
+	if login, _, _ := f.counts(); login != 2 {
+		t.Fatalf("login calls = %d, want 2", login)
+	}
+
+	if err := r.refresh(context.Background(), gen); err != nil {
+		t.Errorf("refresh at stale generation = %v, want nil", err)
+	}
+	if login, _, _ := f.counts(); login != 2 {
+		t.Errorf("login calls = %d, want 2 (newer generation short-circuits)", login)
 	}
 }
 
@@ -483,7 +731,12 @@ func TestSessionLossPredicate(t *testing.T) {
 		{"server error", http.StatusInternalServerError, "", false},
 		{"login redirect", http.StatusFound, "https://prg1.t-cloud.eu/accounts/login/", true},
 		{"relative login redirect", http.StatusFound, "/accounts/login/", true},
+		{"bare relative login", http.StatusFound, "login/", true},
+		{"login redirect with query", http.StatusFound, "/accounts/login/?next=/api/2.0/", true},
+		{"case-insensitive login", http.StatusFound, "/accounts/Login/", true},
 		{"non-login redirect", http.StatusFound, "/api/2.0/drives/", false},
+		{"login history path", http.StatusFound, "/api/2.0/login_history/", false},
+		{"suffixed login path", http.StatusFound, "/api/2.0/something-login/", false},
 		{"permanent login redirect", http.StatusMovedPermanently, "/login", true},
 	}
 	for _, tc := range cases {
@@ -499,6 +752,33 @@ func TestSessionLossPredicate(t *testing.T) {
 	}
 	if isSessionLoss(nil) {
 		t.Error("isSessionLoss(nil) = true, want false")
+	}
+}
+
+func TestIsLoginRedirect(t *testing.T) {
+	cases := []struct {
+		location string
+		want     bool
+	}{
+		{"", false},
+		{"/login", true},
+		{"/accounts/login/", true},
+		{"login/", true},
+		{"accounts/login/", true},
+		{"https://prg1.t-cloud.eu/accounts/login/", true},
+		{"/accounts/login/?next=/api/2.0/", true},
+		{"/api/2.0/login_history/", false},
+		{"/api/2.0/something-login/", false},
+		{"/api/2.0/drives/", false},
+		{"https://example.com/login-help", false},
+		{"/login\x00", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.location, func(t *testing.T) {
+			if got := isLoginRedirect(tc.location); got != tc.want {
+				t.Errorf("isLoginRedirect(%q) = %v, want %v", tc.location, got, tc.want)
+			}
+		})
 	}
 }
 

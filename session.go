@@ -21,6 +21,11 @@ import (
 	"unicode"
 )
 
+// loginResponseBytes caps handshake bodies. It stays much smaller than
+// maxResponseBytes because the handshake only returns tiny JSON objects, but
+// overflow is detected rather than silently truncated.
+const loginResponseBytes = 1 << 16
+
 // TOTP returns the RFC 6238 code for a base32 secret at time t.
 func TOTP(secret string, t time.Time) (string, error) {
 	// Authenticator apps display the secret in space-separated groups.
@@ -238,7 +243,10 @@ func (a *authenticator) doJSON(ctx context.Context, client *http.Client, method,
 	}
 	defer func() { _ = response.Body.Close() }()
 
-	payload, _ := io.ReadAll(io.LimitReader(response.Body, 1<<16))
+	payload, err := readCapped(response.Body, loginResponseBytes)
+	if err != nil {
+		return nil, err
+	}
 	if response.StatusCode < 200 || response.StatusCode > 299 {
 		return nil, &APIError{
 			StatusCode: response.StatusCode,
@@ -258,11 +266,13 @@ type refresher struct {
 	maxAttempts int
 	baseDelay   time.Duration
 	maxDelay    time.Duration
+	cooldown    time.Duration
 
-	mu         sync.Mutex
-	generation uint64
-	inFlight   chan struct{}
-	lastErr    error
+	mu            sync.Mutex
+	generation    uint64
+	inFlight      chan struct{}
+	lastErr       error
+	lastFailureAt time.Time
 }
 
 func newRefresher(auth *authenticator) *refresher {
@@ -271,6 +281,7 @@ func newRefresher(auth *authenticator) *refresher {
 		maxAttempts: 4,
 		baseDelay:   time.Second,
 		maxDelay:    10 * time.Second,
+		cooldown:    30 * time.Second,
 	}
 }
 
@@ -284,6 +295,10 @@ func (r *refresher) currentGeneration() uint64 {
 // before sending its request; when it no longer matches, a concurrent refresh
 // already fixed the session and the caller should just retry. Callers sharing
 // the same generation block on a single handshake.
+//
+// A cycle that failed is remembered for cooldown: further refreshes at the same
+// generation fail fast with the same error instead of starting another full
+// handshake cycle. A newer generation always wins over the cooldown.
 func (r *refresher) refresh(ctx context.Context, seen uint64) error {
 	r.mu.Lock()
 	if r.generation != seen {
@@ -303,6 +318,12 @@ func (r *refresher) refresh(ctx context.Context, seen uint64) error {
 			return ctx.Err()
 		}
 	}
+	if r.lastErr != nil && !r.lastFailureAt.IsZero() &&
+		r.auth.now().Sub(r.lastFailureAt) < r.cooldown {
+		err := r.lastErr
+		r.mu.Unlock()
+		return err
+	}
 	done := make(chan struct{})
 	r.inFlight = done
 	r.mu.Unlock()
@@ -313,6 +334,9 @@ func (r *refresher) refresh(ctx context.Context, seen uint64) error {
 	r.lastErr = err
 	if err == nil {
 		r.generation++
+		r.lastFailureAt = time.Time{}
+	} else {
+		r.lastFailureAt = r.auth.now()
 	}
 	r.inFlight = nil
 	close(done)
@@ -402,7 +426,18 @@ func (t *refreshTransport) RoundTrip(request *http.Request) (*http.Response, err
 	if err := t.refresh(request.Context(), generation); err != nil {
 		return nil, err
 	}
-	return t.attempt(request, body)
+
+	retried, err := t.attempt(request, body)
+	if err != nil {
+		return nil, err
+	}
+	if isSessionLoss(retried) {
+		// Session loss survived the single retry. Return a typed error rather
+		// than the response: for a login redirect the http.Client would
+		// otherwise follow the Location and fetch the login page.
+		return nil, sessionLossError(request, retried)
+	}
+	return retried, nil
 }
 
 func (t *refreshTransport) attempt(request *http.Request, body []byte) (*http.Response, error) {
@@ -436,11 +471,29 @@ func bufferBody(request *http.Request) ([]byte, error) {
 }
 
 func closeBody(response *http.Response) {
+	_ = drainBody(response)
+}
+
+// drainBody consumes and closes a response body and returns what it read.
+func drainBody(response *http.Response) []byte {
 	if response == nil || response.Body == nil {
-		return
+		return nil
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<16))
+	payload, _ := io.ReadAll(io.LimitReader(response.Body, 1<<16))
 	_ = response.Body.Close()
+	return payload
+}
+
+// sessionLossError turns a persistent session-loss response into an APIError
+// carrying the real status, body, method and URL.
+func sessionLossError(request *http.Request, response *http.Response) error {
+	payload := drainBody(response)
+	return &APIError{
+		StatusCode: response.StatusCode,
+		Body:       strings.TrimSpace(string(payload)),
+		Method:     request.Method,
+		URL:        request.URL.String(),
+	}
 }
 
 // isSessionLoss reports whether a response means the session is no longer
@@ -460,8 +513,23 @@ func isSessionLoss(response *http.Response) bool {
 	return isLoginRedirect(response.Header.Get("Location"))
 }
 
+// isLoginRedirect reports whether a Location header targets a login path. It
+// matches whole path segments, so a legitimate "/api/2.0/login_history/" is not
+// mistaken for session loss. Relative and absolute locations both parse.
 func isLoginRedirect(location string) bool {
-	return strings.Contains(strings.ToLower(location), "login")
+	if location == "" {
+		return false
+	}
+	u, err := url.Parse(location)
+	if err != nil {
+		return false
+	}
+	for _, segment := range strings.Split(u.Path, "/") {
+		if strings.EqualFold(segment, "login") {
+			return true
+		}
+	}
+	return false
 }
 
 func isRateLimited(err error) bool {

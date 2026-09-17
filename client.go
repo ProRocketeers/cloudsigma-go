@@ -13,7 +13,9 @@ import (
 
 const defaultTimeout = 60 * time.Second
 
-const maxResponseBytes = 1 << 20
+// maxResponseBytes caps the response body Client.do will read. An oversized
+// body fails with ErrResponseTooLarge rather than being silently truncated.
+const maxResponseBytes = 8 << 20
 
 // Config configures a Client. BaseURL follows the same convention as Login:
 // host and path without a scheme, e.g. "prg1.t-cloud.eu/api/2.0/". A scheme is
@@ -28,10 +30,10 @@ type Config struct {
 	Timeout     time.Duration
 }
 
-// New performs the login handshake and returns a ready Client. Each call
-// authenticates independently: unlike Login there is no cache, so a
+// New performs the login handshake under ctx and returns a ready Client. Each
+// call authenticates independently: unlike Login there is no cache, so a
 // long-running controller gets its own session and its own refresh path.
-func New(cfg Config) (*Client, error) {
+func New(ctx context.Context, cfg Config) (*Client, error) {
 	if strings.TrimSpace(cfg.BaseURL) == "" {
 		return nil, errors.New("cloudsigma: BaseURL is required")
 	}
@@ -45,7 +47,7 @@ func New(cfg Config) (*Client, error) {
 		return nil, err
 	}
 	refresher := newRefresher(auth)
-	if err := refresher.refresh(context.Background(), refresher.currentGeneration()); err != nil {
+	if err := refresher.refresh(ctx, refresher.currentGeneration()); err != nil {
 		return nil, err
 	}
 
@@ -113,11 +115,21 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
+		// The refreshing transport surfaces persistent session loss as an
+		// *APIError; unwrap it so callers see the same typed shape as the
+		// ordinary non-2xx path instead of a *url.Error.
+		var apiErr *APIError
+		if errors.As(err, &apiErr) {
+			return apiErr
+		}
 		return err
 	}
 	defer func() { _ = response.Body.Close() }()
 
-	payload, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes))
+	payload, readErr := readCapped(response.Body, maxResponseBytes)
+	if readErr != nil {
+		return readErr
+	}
 	if response.StatusCode < 200 || response.StatusCode > 299 {
 		return &APIError{
 			StatusCode: response.StatusCode,
@@ -125,9 +137,6 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 			Method:     method,
 			URL:        endpoint,
 		}
-	}
-	if readErr != nil {
-		return readErr
 	}
 	if out != nil && len(bytes.TrimSpace(payload)) > 0 {
 		if err := json.Unmarshal(payload, out); err != nil {
