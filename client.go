@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -127,16 +128,25 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	defer func() { _ = response.Body.Close() }()
 
 	payload, readErr := readCapped(response.Body, maxResponseBytes)
-	if readErr != nil {
-		return readErr
-	}
 	if response.StatusCode < 200 || response.StatusCode > 299 {
-		return &APIError{
+		apiErr := &APIError{
 			StatusCode: response.StatusCode,
-			Body:       strings.TrimSpace(string(payload)),
 			Method:     method,
 			URL:        endpoint,
 		}
+		switch {
+		case readErr == nil:
+			apiErr.Body = strings.TrimSpace(string(payload))
+		case errors.Is(readErr, ErrResponseTooLarge):
+			// Keep the status: callers branch on it, and a truncated body would mislead.
+			apiErr.Body = fmt.Sprintf("<response body exceeded %d bytes>", maxResponseBytes)
+		default:
+			return readErr
+		}
+		return apiErr
+	}
+	if readErr != nil {
+		return readErr
 	}
 	if out != nil && len(bytes.TrimSpace(payload)) > 0 {
 		if err := json.Unmarshal(payload, out); err != nil {

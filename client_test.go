@@ -166,6 +166,11 @@ func (f *fakeAPI) handleBlob(w http.ResponseWriter, r *http.Request) {
 		body[i] = ' '
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if s := r.URL.Query().Get("status"); s != "" {
+		if code, convErr := strconv.Atoi(s); convErr == nil {
+			w.WriteHeader(code)
+		}
+	}
 	_, _ = w.Write(body)
 }
 
@@ -503,6 +508,28 @@ func TestResponseTooLargeFailsLoudly(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), strconv.Itoa(maxResponseBytes)) {
 		t.Errorf("error = %q, want it to name the %d-byte limit", err, maxResponseBytes)
+	}
+}
+
+func TestOversizedNon2xxKeepsStatus(t *testing.T) {
+	f := newFakeAPI(t)
+	client := f.newClient(t)
+
+	err := client.Get(context.Background(),
+		fmt.Sprintf("blob/?size=%d&status=%d", maxResponseBytes+1, http.StatusForbidden), nil)
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want *APIError so callers can map the status code", err)
+	}
+	if apiErr.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", apiErr.StatusCode)
+	}
+	if errors.Is(err, ErrResponseTooLarge) {
+		t.Error("error must not surface as the overflow sentinel when the status is known")
+	}
+	if !strings.Contains(apiErr.Body, strconv.Itoa(maxResponseBytes)) {
+		t.Errorf("Body = %q, want it to note the %d-byte overflow", apiErr.Body, maxResponseBytes)
 	}
 }
 
