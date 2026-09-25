@@ -27,39 +27,71 @@ go get github.com/ProRocketeers/cloudsigma-go
 
 ## Session refresh
 
-Both `Login` and `New` attach a `RoundTripper` that detects session loss — a
-`401`, or the login-page redirect the API returns for an unauthenticated
-session — **before** the redirect is followed. On session loss it re-runs the
-handshake and replays the original request exactly once:
+Both `Login` and `New` attach a `RoundTripper` that detects a `401`, a login
+redirect, and (when impersonating) the measured `403` response
+`impersonation session has been closed`. On session loss it authenticates into
+a fresh cookie jar, publishes the complete session only after OTP verification
+and impersonation succeed, then replays the request at most once:
 
 - The handshake is **single-flight**: N goroutines that hit a `401` at the same
   time trigger exactly one login; the rest wait and then retry.
 - Request bodies are buffered, so a retried write sends byte-identical content.
 - Only session loss is retried. A `5xx` is returned untouched so the caller can
   decide (the CSI driver maps it to `UNAVAILABLE` and lets the CO retry).
-- Rate-limited re-login ("too many failed authentication attempts") backs off
-  with bounded exponential delays and gives up after a capped number of
-  attempts, so bad credentials fail fast.
+- Rate limits honor valid `Retry-After` seconds or HTTP dates. Without one,
+  retries use bounded exponential backoff with jitter. A cycle makes at most
+  four handshakes; credentials rejected at login are not retried. An OTP
+  rejection can wait for one new TOTP window, because rejection alone does not
+  establish whether the code was replayed or the clocks differ.
 - A refresh cycle that ends in error is remembered for a 30s cooldown: further
   session-loss responses at the same generation fail fast with the remembered
   error instead of starting another full handshake cycle. A refresh that sees a
   newer generation (another goroutine already succeeded) still returns
   immediately.
-- If session loss persists after the single retry, `RoundTrip` returns an
-  `*APIError` (real status, body, method and URL) instead of the response, so a
-  login redirect can never reach the HTTP client's redirect logic. `Client.do`
-  unwraps that error so callers get the same typed shape as an ordinary non-2xx
-  response.
+- If session loss persists after replay, the SDK records an ineffective
+  recovery cooldown. It returns an `*AuthError` with stage `session_recovery`
+  and kind `persistent_session_loss`, wrapping the real `*APIError` for
+  `errors.As` callers. Ordinary permission 403s, 5xx responses, transport
+  timeouts, and ambiguous writes are not replayed by authentication code.
 - Response bodies are capped at 8 MiB. An oversized body fails with
   `ErrResponseTooLarge` (test with `errors.Is`) rather than being silently
   truncated and mis-reported as a JSON error.
-- The handshake itself runs on a bare client that shares the cookie jar, so a
-  `401` during login can never re-enter the refreshing transport.
+- The handshake runs on a bare client, so a login failure cannot recurse
+  through the refreshing transport. `Client.Close` cancels an in-progress
+  recovery; individual recovery attempts also have a deadline.
 
 `Login` keeps its package-level cache keyed by credentials, so the muxed
 Terraform provider still performs a single handshake across both servers; the
 cache now also carries the refreshing transport, removing the previous "expired
 session 401s until restart" behaviour.
+
+`AuthError` reports the failing stage (`login`, `otp_verification`,
+`impersonation`, or `session_recovery`), kind, wrapped cause, and server retry
+timing. Its message omits credentials, cookies, OTP values, and server bodies;
+`errors.As(err, &apiErr)` still exposes the underlying `APIError` when needed.
+Set `Config.OnAuthEvent` before calling `New` to observe bounded handshake,
+recovery, cooldown, and rate-limit events, including the initial handshake.
+Callbacks can run concurrently and should return quickly. Their stage,
+reason, and outcome fields are safe for low-cardinality metrics.
+
+## Optional local session cache
+
+Set `Config.SessionCacheDir` (or `LoginOptions.SessionCacheDir` with
+`LoginWithOptions`) to an absolute private directory to reuse a session across
+short-lived local processes. Caching is disabled by default. The directory
+must be owned by the current user with mode `0700`; entries and lock files use
+`0600`. Unsafe permissions, symlinks, and corrupt entries return actionable
+errors. Entries contain bearer cookies, cookie scope and expiry, an identity
+binding, generation, and retry timing. They never contain the password or TOTP
+seed. Session cookies without server expiry get a local 30-minute upper bound;
+revoked cookies still use normal recovery.
+
+An account-level OS lock serializes authentication across impersonation
+targets, while entries are target-specific. Processes must share the same
+local directory for this to coordinate them. It cannot prevent OTP collisions
+with browsers, other hosts, or independently configured controllers. Controller
+pods should leave caching disabled unless their storage and lifecycle have been
+reviewed for that deployment.
 
 ## Usage
 

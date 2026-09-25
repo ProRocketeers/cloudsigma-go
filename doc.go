@@ -12,16 +12,19 @@
 // returns a *Client with Get/Post/Put/Delete helpers. It does not cache, so each
 // caller owns its session.
 //
-// Both Login and New attach a transport that detects session loss (a 401, or the
-// login-page redirect the API returns for an unauthenticated session),
-// re-authenticates once through a single-flight refresher, and replays the
-// original request. Only session loss is retried; other failures are returned
-// untouched. A refresh cycle that fails is not started again until a cooldown
-// elapses, so repeated 401s cannot drive repeated handshake cycles.
+// Both Login and New attach a transport that detects a 401, a login redirect,
+// and the measured impersonation-closed 403 when impersonation is configured.
+// Recovery authenticates into a fresh cookie jar, publishes it after the full
+// handshake, and replays once. A single-flight refresher and failure cooldown
+// bound login attempts. Other failures are returned without authentication
+// replay.
 //
-// Errors are typed: APIError carries StatusCode, Body, Method and URL for
-// callers that branch on the HTTP status, and a response body larger than the
-// read cap yields ErrResponseTooLarge instead of a truncated payload.
+// Errors are typed: AuthError reports stage, kind, wrapped cause, and retry
+// timing without printing server bodies; APIError remains available through
+// errors.As. Config.OnAuthEvent reports bounded authentication events. Optional
+// Config.SessionCacheDir enables private local session reuse for short-lived
+// processes; it is disabled by default. A response body larger than the read
+// cap yields ErrResponseTooLarge instead of a truncated payload.
 //
 // The package uses only the Go standard library.
 package cloudsigma

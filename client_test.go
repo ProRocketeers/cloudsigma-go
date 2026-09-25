@@ -659,8 +659,11 @@ func TestRateLimitedReloginBacksOffThenFailsFast(t *testing.T) {
 		t.Fatalf("newAuthenticator: %v", err)
 	}
 	var sleeps []time.Duration
+	now := time.Unix(1_700_000_000, 0)
+	auth.now = func() time.Time { return now }
 	auth.sleep = func(_ context.Context, d time.Duration) error {
 		sleeps = append(sleeps, d)
+		now = now.Add(d)
 		return nil
 	}
 
