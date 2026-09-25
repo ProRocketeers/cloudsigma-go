@@ -140,15 +140,17 @@ func classifyAuthError(stage AuthStage, err error) *AuthError {
 		if errors.As(err, &apiErr) {
 			switch stage {
 			case AuthStageLogin:
-				if apiErr.StatusCode == http.StatusBadRequest || apiErr.StatusCode == http.StatusUnauthorized {
+				switch apiErr.StatusCode {
+				case http.StatusBadRequest, http.StatusUnauthorized:
 					kind = AuthKindRejectedCredentials
-				} else if apiErr.StatusCode == http.StatusForbidden {
+				case http.StatusForbidden:
 					kind = AuthKindPermissionDenied
 				}
 			case AuthStageOTPVerification:
-				if apiErr.StatusCode == http.StatusBadRequest || apiErr.StatusCode == http.StatusUnauthorized {
+				switch apiErr.StatusCode {
+				case http.StatusBadRequest, http.StatusUnauthorized:
 					kind = AuthKindRejectedOTP
-				} else if apiErr.StatusCode == http.StatusForbidden {
+				case http.StatusForbidden:
 					kind = AuthKindPermissionDenied
 				}
 			case AuthStageImpersonation:
