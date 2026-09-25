@@ -29,6 +29,12 @@ type Config struct {
 	Impersonate string
 	UserAgent   string
 	Timeout     time.Duration
+	// SessionCacheDir enables local, private session reuse when nonempty.
+	// It coordinates only processes sharing this directory on one host.
+	SessionCacheDir string
+	// OnAuthEvent receives bounded authentication lifecycle events. It is
+	// installed before New sends its first handshake request.
+	OnAuthEvent AuthEventHandler
 }
 
 // New performs the login handshake under ctx and returns a ready Client. Each
@@ -43,26 +49,40 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		timeout = defaultTimeout
 	}
 
-	auth, err := newAuthenticator(cfg.BaseURL, cfg.Username, cfg.Password, cfg.OTPSecret, cfg.Impersonate, cfg.UserAgent, timeout)
+	auth, err := newAuthenticatorWithEvents(cfg.BaseURL, cfg.Username, cfg.Password, cfg.OTPSecret, cfg.Impersonate, cfg.UserAgent, timeout, cfg.OnAuthEvent)
 	if err != nil {
 		return nil, err
 	}
 	refresher := newRefresher(auth)
-	if err := refresher.refresh(ctx, refresher.currentGeneration()); err != nil {
+	if err := refresher.configureStore(cfg.SessionCacheDir); err != nil {
 		return nil, err
 	}
+	if err := refresher.initialize(ctx); err != nil {
+		return nil, err
+	}
+	_, initialJar := refresher.snapshot()
 
 	return &Client{
-		http: &http.Client{Jar: auth.jar, Timeout: timeout, Transport: refresher.transport()},
-		base: auth.root,
+		http:      &http.Client{Jar: initialJar, Timeout: timeout, Transport: refresher.transport()},
+		base:      auth.root,
+		refresher: refresher,
 	}, nil
 }
 
 // Client is a JSON client for the CloudSigma 2.0 API. It shares one session
 // across all goroutines and transparently recovers from session expiry.
 type Client struct {
-	http *http.Client
-	base string
+	http      *http.Client
+	base      string
+	refresher *refresher
+}
+
+// Close cancels any in-progress session recovery. It does not log out the
+// server-side session, which may also be used by another local process.
+func (c *Client) Close() {
+	if c != nil && c.refresher != nil {
+		c.refresher.close()
+	}
 }
 
 // HTTPClient returns the underlying client, for callers that need to drive the
@@ -119,6 +139,10 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		// The refreshing transport surfaces persistent session loss as an
 		// *APIError; unwrap it so callers see the same typed shape as the
 		// ordinary non-2xx path instead of a *url.Error.
+		var authErr *AuthError
+		if errors.As(err, &authErr) {
+			return authErr
+		}
 		var apiErr *APIError
 		if errors.As(err, &apiErr) {
 			return apiErr

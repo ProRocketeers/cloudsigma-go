@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -67,25 +68,48 @@ var (
 // servers configure independently, and the API rejects a TOTP code that has
 // already been spent - the second login would fail every time.
 func Login(ctx context.Context, baseURL, username, password, otpSecret, impersonate, userAgent string) (*http.Client, error) {
+	return LoginWithOptions(ctx, baseURL, username, password, otpSecret, impersonate, userAgent, LoginOptions{})
+}
+
+// LoginWithOptions performs the legacy login flow with optional SDK
+// configuration. A non-nil OnAuthEvent handler receives events from this
+// client, including its initial handshake. Configured clients are intentionally
+// not placed in Login's package cache: the cache predates per-caller event
+// handlers and must never silently suppress a requested callback.
+func LoginWithOptions(ctx context.Context, baseURL, username, password, otpSecret, impersonate, userAgent string, options LoginOptions) (*http.Client, error) {
 	key := sha256.Sum256([]byte(strings.Join([]string{baseURL, username, password, otpSecret, impersonate}, "\x00")))
 
-	sessionMu.Lock()
-	defer sessionMu.Unlock()
-	if cached, ok := sessionCache[key]; ok {
-		return cached, nil
+	cacheable := options.OnAuthEvent == nil && options.Timeout <= 0 && options.SessionCacheDir == ""
+	if cacheable {
+		sessionMu.Lock()
+		defer sessionMu.Unlock()
+		cached, ok := sessionCache[key]
+		if ok {
+			return cached, nil
+		}
 	}
 
-	auth, err := newAuthenticator(baseURL, username, password, otpSecret, impersonate, userAgent, 60*time.Second)
+	timeout := options.Timeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	auth, err := newAuthenticatorWithEvents(baseURL, username, password, otpSecret, impersonate, userAgent, timeout, options.OnAuthEvent)
 	if err != nil {
 		return nil, err
 	}
 	refresher := newRefresher(auth)
-	if err := refresher.refresh(ctx, refresher.currentGeneration()); err != nil {
+	if err := refresher.configureStore(options.SessionCacheDir); err != nil {
+		return nil, err
+	}
+	if err := refresher.initialize(ctx); err != nil {
 		return nil, err
 	}
 
-	client := &http.Client{Jar: auth.jar, Timeout: auth.timeout, Transport: refresher.transport()}
-	sessionCache[key] = client
+	_, initialJar := refresher.snapshot()
+	client := &http.Client{Jar: initialJar, Timeout: auth.timeout, Transport: refresher.transport()}
+	if cacheable {
+		sessionCache[key] = client
+	}
 
 	return client, nil
 }
@@ -107,11 +131,16 @@ type authenticator struct {
 	impersonate string
 	userAgent   string
 
-	sleep func(context.Context, time.Duration) error
-	now   func() time.Time
+	sleep   func(context.Context, time.Duration) error
+	now     func() time.Time
+	onEvent AuthEventHandler
 }
 
 func newAuthenticator(baseURL, username, password, otpSecret, impersonate, userAgent string, timeout time.Duration) (*authenticator, error) {
+	return newAuthenticatorWithEvents(baseURL, username, password, otpSecret, impersonate, userAgent, timeout, nil)
+}
+
+func newAuthenticatorWithEvents(baseURL, username, password, otpSecret, impersonate, userAgent string, timeout time.Duration, onEvent AuthEventHandler) (*authenticator, error) {
 	root := baseURL
 	if !strings.Contains(root, "://") {
 		root = "https://" + strings.TrimSuffix(root, "/") + "/"
@@ -145,15 +174,23 @@ func newAuthenticator(baseURL, username, password, otpSecret, impersonate, userA
 		userAgent:   userAgent,
 		sleep:       realSleep,
 		now:         time.Now,
+		onEvent:     onEvent,
 	}, nil
 }
 
 func (a *authenticator) handshake(ctx context.Context) error {
+	a.emit(AuthEvent{
+		Type:    AuthEventHandshakeStart,
+		Stage:   AuthStageLogin,
+		Reason:  authEventReasonInitial,
+		Outcome: authEventOutcomeStarted,
+	})
+
 	client := &http.Client{Jar: a.jar, Timeout: a.timeout}
 
 	body, _ := json.Marshal(map[string]string{"username": a.username, "password": a.password})
 	if _, err := a.doJSON(ctx, client, http.MethodPost, a.root+"accounts/action/?do=login", body, nil); err != nil {
-		return fmt.Errorf("login failed: %w", err)
+		return a.finishHandshake(AuthStageLogin, err)
 	}
 
 	verify := func() error {
@@ -168,7 +205,7 @@ func (a *authenticator) handshake(ctx context.Context) error {
 
 	err := verify()
 	var failed *APIError
-	if errors.As(err, &failed) && failed.StatusCode == http.StatusUnauthorized {
+	if !isRateLimited(err) && errors.As(err, &failed) && failed.StatusCode == http.StatusUnauthorized {
 		// Terraform runs a fresh provider process for the apply walk, so a
 		// plan and an apply seconds apart present the same code twice and the
 		// API rejects the second as a replay. The next window is a new code.
@@ -176,12 +213,12 @@ func (a *authenticator) handshake(ctx context.Context) error {
 		// ponytail: costs up to 30s per collision. If that grates, cache the
 		// session cookie on disk instead of re-authenticating per process.
 		if waitErr := a.waitForNextWindow(ctx); waitErr != nil {
-			return waitErr
+			return a.finishHandshake(AuthStageOTPVerification, waitErr)
 		}
 		err = verify()
 	}
 	if err != nil {
-		return fmt.Errorf("OTP verification failed: %w", err)
+		return a.finishHandshake(AuthStageOTPVerification, err)
 	}
 
 	if a.impersonate != "" {
@@ -190,25 +227,66 @@ func (a *authenticator) handshake(ctx context.Context) error {
 		headers := map[string]string{"X-CSRFToken": csrf(a.jar, a.apiURL)}
 		req, err := a.newRequest(ctx, http.MethodGet, a.root+"impersonate/"+a.impersonate+"/", nil, headers)
 		if err != nil {
-			return err
+			return a.finishHandshake(AuthStageImpersonation, err)
 		}
 		resp, err := client.Do(req)
 		if err != nil {
-			return fmt.Errorf("impersonation failed: %w", err)
+			return a.finishHandshake(AuthStageImpersonation, err)
 		}
+		payload, readErr := readCapped(resp.Body, loginResponseBytes)
 		_ = resp.Body.Close()
-		if resp.StatusCode < 200 || resp.StatusCode > 299 {
-			return fmt.Errorf("impersonation failed: %s", resp.Status)
+		if readErr != nil {
+			return a.finishHandshake(AuthStageImpersonation, readErr)
 		}
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			return a.finishHandshake(AuthStageImpersonation, &authAPIError{
+				APIError: &APIError{
+					StatusCode: resp.StatusCode,
+					Body:       strings.TrimSpace(string(payload)),
+					Method:     http.MethodGet,
+					URL:        req.URL.String(),
+				},
+				retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), a.now()),
+			})
+		}
+		return a.finishHandshake(AuthStageImpersonation, nil)
 	}
 
+	return a.finishHandshake(AuthStageOTPVerification, nil)
+}
+
+func (a *authenticator) finishHandshake(stage AuthStage, err error) error {
+	if err != nil {
+		authErr := classifyAuthError(stage, err)
+		a.emit(AuthEvent{
+			Type:       AuthEventHandshakeResult,
+			Stage:      authErr.Stage,
+			Reason:     string(authErr.Kind),
+			Outcome:    authEventOutcomeFailure,
+			RetryAfter: authErr.RetryAfter,
+		})
+		return authErr
+	}
+	a.emit(AuthEvent{
+		Type:    AuthEventHandshakeResult,
+		Stage:   stage,
+		Reason:  authEventReasonAuthentication,
+		Outcome: authEventOutcomeSuccess,
+	})
 	return nil
+}
+
+func (a *authenticator) emit(event AuthEvent) {
+	if a == nil || a.onEvent == nil {
+		return
+	}
+	a.onEvent(event)
 }
 
 // waitForNextWindow blocks until the current TOTP code has expired.
 func (a *authenticator) waitForNextWindow(ctx context.Context) error {
 	next := time.Unix((a.now().Unix()/30+1)*30+1, 0)
-	return a.sleep(ctx, time.Until(next))
+	return a.sleep(ctx, next.Sub(a.now()))
 }
 
 func (a *authenticator) newRequest(ctx context.Context, method, url string, body []byte, headers map[string]string) (*http.Request, error) {
@@ -248,11 +326,14 @@ func (a *authenticator) doJSON(ctx context.Context, client *http.Client, method,
 		return nil, err
 	}
 	if response.StatusCode < 200 || response.StatusCode > 299 {
-		return nil, &APIError{
-			StatusCode: response.StatusCode,
-			Body:       strings.TrimSpace(string(payload)),
-			Method:     method,
-			URL:        url,
+		return nil, &authAPIError{
+			APIError: &APIError{
+				StatusCode: response.StatusCode,
+				Body:       strings.TrimSpace(string(payload)),
+				Method:     method,
+				URL:        url,
+			},
+			retryAfter: parseRetryAfter(response.Header.Get("Retry-After"), a.now()),
 		}
 	}
 	return payload, nil
@@ -267,22 +348,176 @@ type refresher struct {
 	baseDelay   time.Duration
 	maxDelay    time.Duration
 	cooldown    time.Duration
+	jitter      func(time.Duration) time.Duration
 
 	mu            sync.Mutex
 	generation    uint64
+	jar           http.CookieJar
 	inFlight      chan struct{}
 	lastErr       error
 	lastFailureAt time.Time
+	notBefore     time.Time
+	lifetime      context.Context
+	cancel        context.CancelFunc
+	store         *FileSessionStore
+	storeKey      SessionKey
 }
 
 func newRefresher(auth *authenticator) *refresher {
+	lifetime, cancel := context.WithCancel(context.Background())
 	return &refresher{
 		auth:        auth,
 		maxAttempts: 4,
 		baseDelay:   time.Second,
 		maxDelay:    10 * time.Second,
 		cooldown:    30 * time.Second,
+		jitter:      func(d time.Duration) time.Duration { return d - time.Duration(rand.Int63n(int64(d/4)+1)) },
+		lifetime:    lifetime,
+		cancel:      cancel,
 	}
+}
+
+func (r *refresher) configureStore(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	store, err := NewFileSessionStore(dir)
+	if err != nil {
+		return err
+	}
+	r.store = store
+	r.storeKey = SessionKey{
+		Endpoint:              r.auth.root,
+		Username:              r.auth.username,
+		Impersonate:           r.auth.impersonate,
+		CredentialFingerprint: CredentialFingerprint(r.auth.root, r.auth.username, r.auth.password, r.auth.otp),
+	}
+	return nil
+}
+
+func (r *refresher) restoreRecord(record SessionRecord) (http.CookieJar, error) {
+	jar := NewTrackedCookieJar(nil)
+	jar.now = r.auth.now
+	if err := jar.Restore(record.Cookies); err != nil {
+		return nil, err
+	}
+	return jar, nil
+}
+
+func (r *refresher) saveRecord(ctx context.Context, jar http.CookieJar, generation uint64) error {
+	tracked, ok := jar.(*TrackedCookieJar)
+	if !ok {
+		return errors.New("cloudsigma: session cookie tracking unavailable")
+	}
+	cookies, err := tracked.PersistentCookies(r.auth.now())
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	notBefore := r.notBefore
+	r.mu.Unlock()
+	return r.store.Save(ctx, r.storeKey, SessionRecord{
+		Version:               currentSessionStoreVersion,
+		Endpoint:              r.storeKey.Endpoint,
+		Username:              r.storeKey.Username,
+		CredentialFingerprint: r.storeKey.CredentialFingerprint,
+		Impersonate:           r.storeKey.Impersonate,
+		Cookies:               cookies,
+		Generation:            generation,
+		RetryNotBefore:        notBefore,
+	})
+}
+
+// saveRateLimit persists an account-wide server deadline even when the
+// original caller stopped waiting for that deadline.
+func (r *refresher) saveRateLimit() error {
+	r.mu.Lock()
+	notBefore := r.notBefore
+	r.mu.Unlock()
+	if r.store == nil || !notBefore.After(r.auth.now()) {
+		return nil
+	}
+	persistCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	return r.store.saveAccountRetry(persistCtx, r.storeKey, notBefore)
+}
+
+func (r *refresher) initialize(ctx context.Context) error {
+	if r.store == nil {
+		jar, err := r.login(ctx)
+		if err != nil {
+			return err
+		}
+		r.mu.Lock()
+		r.jar = jar
+		r.generation = 1
+		r.mu.Unlock()
+		return nil
+	}
+	lock, err := r.store.LockAccount(ctx, r.storeKey)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	record, err := r.store.Load(ctx, r.storeKey)
+	if err == nil && len(record.Cookies) > 0 {
+		jar, restoreErr := r.restoreRecord(record)
+		if restoreErr != nil {
+			return restoreErr
+		}
+		r.mu.Lock()
+		r.jar = jar
+		r.generation = record.Generation
+		r.notBefore = record.RetryNotBefore
+		r.mu.Unlock()
+		return nil
+	}
+	if err != nil && !errors.Is(err, ErrSessionCacheNotFound) && !errors.Is(err, ErrSessionExpired) && !errors.Is(err, ErrSessionCacheCredentialMismatch) {
+		return err
+	}
+	if remaining := record.RetryNotBefore.Sub(r.auth.now()); remaining > 0 {
+		return &AuthError{Stage: AuthStageSessionRecovery, Kind: AuthKindPersistentSessionLoss, RetryAfter: remaining}
+	}
+	accountDeadline, err := r.store.loadAccountRetry(ctx, r.storeKey)
+	if err != nil {
+		return err
+	}
+	if remaining := accountDeadline.Sub(r.auth.now()); remaining > 0 {
+		return &AuthError{Stage: AuthStageLogin, Kind: AuthKindRateLimited, RetryAfter: remaining}
+	}
+	jar, err := r.login(ctx)
+	if err != nil {
+		if saveErr := r.saveRateLimit(); saveErr != nil {
+			return saveErr
+		}
+		return err
+	}
+	generation := record.Generation + 1
+	if generation == 0 {
+		generation = 1
+	}
+	if err := r.saveRecord(ctx, jar, generation); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.jar = jar
+	r.generation = generation
+	r.mu.Unlock()
+	return nil
+}
+
+// close stops an in-progress recovery. Callers may close a Client when it is
+// no longer used; each recovery is also independently bounded by a deadline.
+func (r *refresher) close() {
+	if r.cancel != nil {
+		r.cancel()
+	}
+}
+
+func (r *refresher) snapshot() (uint64, http.CookieJar) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.generation, r.jar
 }
 
 func (r *refresher) currentGeneration() uint64 {
@@ -300,6 +535,9 @@ func (r *refresher) currentGeneration() uint64 {
 // generation fail fast with the same error instead of starting another full
 // handshake cycle. A newer generation always wins over the cooldown.
 func (r *refresher) refresh(ctx context.Context, seen uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	r.mu.Lock()
 	if r.generation != seen {
 		r.mu.Unlock()
@@ -318,51 +556,169 @@ func (r *refresher) refresh(ctx context.Context, seen uint64) error {
 			return ctx.Err()
 		}
 	}
+	if remaining := r.notBefore.Sub(r.auth.now()); remaining > 0 {
+		err := r.lastErr
+		r.mu.Unlock()
+		if err == nil {
+			err = &AuthError{Stage: AuthStageSessionRecovery, Kind: AuthKindRateLimited, RetryAfter: remaining}
+		}
+		return err
+	}
 	if r.lastErr != nil && !r.lastFailureAt.IsZero() &&
 		r.auth.now().Sub(r.lastFailureAt) < r.cooldown {
 		err := r.lastErr
+		remaining := r.cooldown - r.auth.now().Sub(r.lastFailureAt)
 		r.mu.Unlock()
+		r.auth.emit(AuthEvent{
+			Type:       AuthEventCooldown,
+			Stage:      AuthStageSessionRecovery,
+			Reason:     authEventReasonCooldown,
+			Outcome:    authEventOutcomeSkipped,
+			RetryAfter: remaining,
+		})
 		return err
 	}
 	done := make(chan struct{})
 	r.inFlight = done
 	r.mu.Unlock()
-
-	err := r.login(ctx)
-
-	r.mu.Lock()
-	r.lastErr = err
-	if err == nil {
-		r.generation++
-		r.lastFailureAt = time.Time{}
-	} else {
-		r.lastFailureAt = r.auth.now()
+	// The client owns recovery. A canceled request leaves other waiters' shared
+	// handshake intact; the deadline and Close bound its lifetime.
+	go func() {
+		limit := 2*r.auth.timeout + 35*time.Second
+		if limit < 35*time.Second {
+			limit = 35 * time.Second
+		}
+		lifetime := r.lifetime
+		if lifetime == nil {
+			lifetime = context.Background()
+		}
+		recoveryCtx, cancel := context.WithTimeout(lifetime, limit)
+		defer cancel()
+		jar, nextGeneration, err := r.recover(recoveryCtx, seen)
+		r.mu.Lock()
+		r.lastErr = err
+		if err == nil {
+			r.jar = jar
+			r.generation = nextGeneration
+			r.lastFailureAt = time.Time{}
+			r.notBefore = time.Time{}
+		} else {
+			r.lastFailureAt = r.auth.now()
+		}
+		r.inFlight = nil
+		close(done)
+		r.mu.Unlock()
+	}()
+	select {
+	case <-done:
+		r.mu.Lock()
+		err := r.lastErr
+		r.mu.Unlock()
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	r.inFlight = nil
-	close(done)
-	r.mu.Unlock()
+}
 
-	return err
+func (r *refresher) recover(ctx context.Context, seen uint64) (http.CookieJar, uint64, error) {
+	if r.store == nil {
+		jar, err := r.login(ctx)
+		return jar, seen + 1, err
+	}
+	lock, err := r.store.LockAccount(ctx, r.storeKey)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer lock.Close()
+	record, loadErr := r.store.Load(ctx, r.storeKey)
+	if loadErr == nil && len(record.Cookies) > 0 && record.Generation > seen {
+		jar, err := r.restoreRecord(record)
+		return jar, record.Generation, err
+	}
+	if loadErr != nil && !errors.Is(loadErr, ErrSessionCacheNotFound) && !errors.Is(loadErr, ErrSessionExpired) && !errors.Is(loadErr, ErrSessionCacheCredentialMismatch) {
+		return nil, 0, loadErr
+	}
+	if remaining := record.RetryNotBefore.Sub(r.auth.now()); remaining > 0 {
+		return nil, 0, &AuthError{Stage: AuthStageSessionRecovery, Kind: AuthKindPersistentSessionLoss, RetryAfter: remaining}
+	}
+	accountDeadline, err := r.store.loadAccountRetry(ctx, r.storeKey)
+	if err != nil {
+		return nil, 0, err
+	}
+	if remaining := accountDeadline.Sub(r.auth.now()); remaining > 0 {
+		return nil, 0, &AuthError{Stage: AuthStageSessionRecovery, Kind: AuthKindRateLimited, RetryAfter: remaining}
+	}
+	jar, err := r.login(ctx)
+	if err != nil {
+		if saveErr := r.saveRateLimit(); saveErr != nil {
+			return nil, 0, saveErr
+		}
+		return nil, 0, err
+	}
+	next := seen + 1
+	if record.Generation >= next {
+		next = record.Generation + 1
+	}
+	if err := r.saveRecord(ctx, jar, next); err != nil {
+		return nil, 0, err
+	}
+	return jar, next, nil
 }
 
 // login retries only a rate-limited handshake, with bounded exponential
 // backoff, and gives up after maxAttempts so a rejected credential fails fast
 // instead of looping forever.
-func (r *refresher) login(ctx context.Context) error {
+func (r *refresher) login(ctx context.Context) (http.CookieJar, error) {
 	var err error
 	for attempt := 0; attempt < r.maxAttempts; attempt++ {
-		err = r.auth.handshake(ctx)
+		candidate := *r.auth
+		tracked := NewTrackedCookieJar(nil)
+		tracked.now = r.auth.now
+		candidate.jar = tracked
+		err = candidate.handshake(ctx)
 		if err == nil {
-			return nil
+			r.mu.Lock()
+			r.notBefore = time.Time{}
+			r.mu.Unlock()
+			return candidate.jar, nil
+		}
+		if isRateLimited(err) && attempt == r.maxAttempts-1 {
+			delay := authRetryAfter(err)
+			if delay <= 0 {
+				delay = r.backoff(attempt)
+			}
+			r.mu.Lock()
+			r.notBefore = r.auth.now().Add(delay)
+			r.mu.Unlock()
 		}
 		if !isRateLimited(err) || attempt == r.maxAttempts-1 {
-			return err
+			return nil, err
 		}
-		if sleepErr := r.auth.sleep(ctx, r.backoff(attempt)); sleepErr != nil {
-			return sleepErr
+		r.auth.emit(AuthEvent{
+			Type:       AuthEventRateLimited,
+			Stage:      authErrorStage(err, AuthStageSessionRecovery),
+			Reason:     authEventReasonRateLimit,
+			Outcome:    authEventOutcomeRetrying,
+			RetryAfter: authRetryAfter(err),
+		})
+		delay := authRetryAfter(err)
+		if delay <= 0 {
+			delay = r.backoff(attempt)
+		}
+		notBefore := r.auth.now().Add(delay)
+		r.mu.Lock()
+		r.notBefore = notBefore
+		r.mu.Unlock()
+		if sleepErr := r.auth.sleep(ctx, delay); sleepErr != nil {
+			return nil, &AuthError{Stage: authErrorStage(err, AuthStageLogin), Kind: AuthKindRateLimited, Cause: errors.Join(err, sleepErr), RetryAfter: delay}
+		}
+		// A test clock (or an interrupted sleep implementation) may not have
+		// reached the deadline. Never spend another login before it has.
+		if remaining := notBefore.Sub(r.auth.now()); remaining > 0 {
+			return nil, &AuthError{Stage: authErrorStage(err, AuthStageLogin), Kind: AuthKindRateLimited, Cause: err, RetryAfter: remaining}
 		}
 	}
-	return err
+	return nil, err
 }
 
 func (r *refresher) backoff(attempt int) time.Duration {
@@ -370,33 +726,95 @@ func (r *refresher) backoff(attempt int) time.Duration {
 	if delay <= 0 || delay > r.maxDelay {
 		delay = r.maxDelay
 	}
+	if r.jitter != nil {
+		delay = r.jitter(delay)
+	}
 	return delay
 }
 
 func (r *refresher) transport() http.RoundTripper {
 	return &refreshTransport{
-		base:       sessionTransport{jar: r.auth.jar, origin: r.auth.origin},
-		jar:        r.auth.jar,
-		refresh:    r.refresh,
-		generation: r.currentGeneration,
+		base:            http.DefaultTransport,
+		refresh:         r.refresh,
+		snapshot:        r.snapshot,
+		origin:          r.auth.origin,
+		impersonate:     r.auth.impersonate != "",
+		noteIneffective: r.noteIneffective,
+		onEvent:         r.auth.onEvent,
 	}
 }
 
-// sessionTransport swaps the SDK's HTTP Basic credentials for the session
-// cookie and adds the CSRF header Django requires on unsafe methods.
-type sessionTransport struct {
-	jar    http.CookieJar
-	origin string
+func (r *refresher) noteIneffective(ctx context.Context, generation uint64, failure error) error {
+	r.mu.Lock()
+	if r.generation != generation || r.inFlight != nil {
+		r.mu.Unlock()
+		return nil
+	}
+	// Reserve this generation before taking the account lock. A newer local
+	// recovery must wait until the marker has either been published or skipped.
+	done := make(chan struct{})
+	r.inFlight = done
+	r.mu.Unlock()
+	result := make(chan error, 1)
+	go func() { result <- r.persistIneffective(generation, failure, done) }()
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
-func (t sessionTransport) RoundTrip(request *http.Request) (*http.Response, error) {
-	request = request.Clone(request.Context())
-	request.Header.Del("Authorization")
-	request.Header.Set("Referer", t.origin)
-	if token := csrf(t.jar, request.URL); token != "" {
-		request.Header.Set("X-CSRFToken", token)
+func (r *refresher) persistIneffective(generation uint64, failure error, done chan struct{}) (result error) {
+	now := r.auth.now()
+	deadline := now.Add(r.cooldown)
+	applyCooldown := true
+	defer func() {
+		r.mu.Lock()
+		if applyCooldown {
+			r.lastErr = failure
+			r.lastFailureAt = now
+			r.notBefore = deadline
+		} else {
+			r.lastErr = result
+		}
+		r.inFlight = nil
+		close(done)
+		r.mu.Unlock()
+	}()
+	if r.store != nil {
+		// Persistence has its own deadline: cancellation or Close must not
+		// leave a failed generation reusable by the next process.
+		ctx, cancel := context.WithTimeout(context.Background(), r.auth.timeout+35*time.Second)
+		defer cancel()
+		lock, err := r.store.LockAccount(ctx, r.storeKey)
+		if err != nil {
+			applyCooldown = false
+			return err
+		}
+		defer lock.Close()
+		record, err := r.store.Load(ctx, r.storeKey)
+		if errors.Is(err, ErrSessionCacheNotFound) || errors.Is(err, ErrSessionCacheCredentialMismatch) || errors.Is(err, ErrSessionExpired) {
+			return nil
+		}
+		if err != nil {
+			applyCooldown = false
+			return err
+		}
+		// A different process may have published a newer session while this
+		// replay was in flight. Never invalidate or cool down that generation.
+		if record.Generation != generation {
+			applyCooldown = false
+			return nil
+		}
+		record.Cookies = nil
+		record.RetryNotBefore = deadline
+		if err := r.store.Save(ctx, r.storeKey, record); err != nil {
+			applyCooldown = false
+			return err
+		}
 	}
-	return http.DefaultTransport.RoundTrip(request)
+	return nil
 }
 
 // refreshTransport watches for session loss, re-logs-in through the shared
@@ -404,10 +822,13 @@ func (t sessionTransport) RoundTrip(request *http.Request) (*http.Response, erro
 // touches non-session failures, so a 5xx passes through for the caller (CSI)
 // to retry.
 type refreshTransport struct {
-	base       http.RoundTripper
-	jar        http.CookieJar
-	refresh    func(context.Context, uint64) error
-	generation func() uint64
+	base            http.RoundTripper
+	refresh         func(context.Context, uint64) error
+	snapshot        func() (uint64, http.CookieJar)
+	origin          string
+	impersonate     bool
+	noteIneffective func(context.Context, uint64, error) error
+	onEvent         AuthEventHandler
 }
 
 func (t *refreshTransport) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -416,45 +837,93 @@ func (t *refreshTransport) RoundTrip(request *http.Request) (*http.Response, err
 		return nil, err
 	}
 
-	generation := t.generation()
-	response, err := t.attempt(request, body)
-	if err != nil || !isSessionLoss(response) {
+	generation, jar := t.snapshot()
+	response, err := t.attempt(request, body, jar)
+	if err != nil || !isSessionLossFor(response, t.impersonate) {
 		return response, err
 	}
 
+	reason := sessionLossReason(response)
 	closeBody(response)
+	t.emit(AuthEvent{
+		Type:    AuthEventRecovery,
+		Stage:   AuthStageSessionRecovery,
+		Reason:  reason,
+		Outcome: authEventOutcomeStarted,
+	})
 	if err := t.refresh(request.Context(), generation); err != nil {
+		t.emit(AuthEvent{
+			Type:    AuthEventRecovery,
+			Stage:   AuthStageSessionRecovery,
+			Reason:  reason,
+			Outcome: authEventOutcomeFailure,
+		})
 		return nil, err
 	}
+	t.emit(AuthEvent{
+		Type:    AuthEventRecovery,
+		Stage:   AuthStageSessionRecovery,
+		Reason:  reason,
+		Outcome: authEventOutcomeSuccess,
+	})
 
-	retried, err := t.attempt(request, body)
+	replayGeneration, jar := t.snapshot()
+	retried, err := t.attempt(request, body, jar)
 	if err != nil {
 		return nil, err
 	}
-	if isSessionLoss(retried) {
+	if isSessionLossFor(retried, t.impersonate) {
 		// Session loss survived the single retry. Return a typed error rather
 		// than the response: for a login redirect the http.Client would
 		// otherwise follow the Location and fetch the login page.
-		return nil, sessionLossError(request, retried)
+		authErr := classifyAuthError(AuthStageSessionRecovery, sessionLossError(request, retried))
+		if t.noteIneffective != nil {
+			if err := t.noteIneffective(request.Context(), replayGeneration, authErr); err != nil {
+				return nil, err
+			}
+		}
+		return nil, authErr
 	}
 	return retried, nil
 }
 
-func (t *refreshTransport) attempt(request *http.Request, body []byte) (*http.Response, error) {
+func (t *refreshTransport) emit(event AuthEvent) {
+	if t == nil || t.onEvent == nil {
+		return
+	}
+	t.onEvent(event)
+}
+
+func (t *refreshTransport) attempt(request *http.Request, body []byte, jar http.CookieJar) (*http.Response, error) {
 	clone := request.Clone(request.Context())
 	if body != nil {
 		clone.Body = io.NopCloser(bytes.NewReader(body))
 		clone.ContentLength = int64(len(body))
 	}
-	// The client's jar added cookies before RoundTrip ran; on a retry those are
-	// stale, so rebuild them from the (possibly just refreshed) jar.
-	if t.jar != nil {
-		clone.Header.Del("Cookie")
-		for _, cookie := range t.jar.Cookies(clone.URL) {
+	clone.Header.Del("Authorization")
+	clone.Header.Set("Referer", t.origin)
+	// http.Client's exposed initial jar may have added old cookies. Always use
+	// the jar captured with this session generation.
+	clone.Header.Del("Cookie")
+	if jar != nil {
+		for _, cookie := range jar.Cookies(clone.URL) {
 			clone.AddCookie(cookie)
 		}
+		if token := csrf(jar, clone.URL); token != "" {
+			clone.Header.Set("X-CSRFToken", token)
+		} else {
+			clone.Header.Del("X-CSRFToken")
+		}
 	}
-	return t.base.RoundTrip(clone)
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	resp, err := base.RoundTrip(clone)
+	if err == nil && resp != nil && jar != nil {
+		jar.SetCookies(clone.URL, resp.Cookies())
+	}
+	return resp, err
 }
 
 func bufferBody(request *http.Request) ([]byte, error) {
@@ -496,16 +965,47 @@ func sessionLossError(request *http.Request, response *http.Response) error {
 	}
 }
 
+func authErrorStage(err error, fallback AuthStage) AuthStage {
+	var authErr *AuthError
+	if errors.As(err, &authErr) && authErr.Stage != "" {
+		return authErr.Stage
+	}
+	return fallback
+}
+
+func sessionLossReason(response *http.Response) string {
+	if response != nil && response.StatusCode >= 300 && response.StatusCode <= 399 {
+		return authEventReasonLoginRedirect
+	}
+	return authEventReasonSessionLoss
+}
+
 // isSessionLoss reports whether a response means the session is no longer
 // valid: an explicit 401, or the login-page redirect the API uses for an
 // unauthenticated session. It is checked in RoundTrip, before the client's
 // redirect policy can follow that redirect.
 func isSessionLoss(response *http.Response) bool {
+	return isSessionLossFor(response, false)
+}
+
+const impersonationSessionClosed = "impersonation session has been closed"
+
+// isSessionLossFor peeks at most 4 KiB of a 403 and restores the consumed
+// bytes, so unrelated permission responses remain intact for API callers.
+func isSessionLossFor(response *http.Response, impersonate bool) bool {
 	if response == nil {
 		return false
 	}
 	if response.StatusCode == http.StatusUnauthorized {
 		return true
+	}
+	if response.StatusCode == http.StatusForbidden && impersonate && response.Body != nil {
+		prefix, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		response.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(prefix), response.Body), response.Body}
+		return strings.Contains(strings.ToLower(string(prefix)), impersonationSessionClosed)
 	}
 	if response.StatusCode < 300 || response.StatusCode > 399 {
 		return false

@@ -1,0 +1,25 @@
+name: release
+
+# Conventional commits on main update a release PR with the next SDK version
+# and CHANGELOG.md. Merging that PR creates the vX.Y.Z tag and GitHub Release.
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v5
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
