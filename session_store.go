@@ -113,6 +113,9 @@ func newSessionCookie(cookie http.Cookie, now time.Time, ttl time.Duration) (Ses
 	if now.IsZero() {
 		now = time.Now()
 	}
+	if cookie.MaxAge > 0 && int64(cookie.MaxAge) > maxCookieAgeSeconds {
+		return SessionCookie{}, ErrSessionCookieNoExpiry
+	}
 	if cookie.Expires.IsZero() && cookie.MaxAge <= 0 {
 		if ttl <= 0 || ttl > MaxSessionCookieTTL {
 			return SessionCookie{}, ErrSessionCookieNoExpiry
@@ -130,15 +133,12 @@ func newSessionCookie(cookie http.Cookie, now time.Time, ttl time.Duration) (Ses
 		SameSite:    cookie.SameSite,
 		LocalExpiry: cookie.Expires.IsZero() && cookie.MaxAge <= 0,
 	}
-	if stored.Expires.IsZero() {
-		if cookie.MaxAge <= 0 {
-			stored.Expires = now.Add(ttl)
-		} else {
-			if int64(cookie.MaxAge) > maxCookieAgeSeconds {
-				return SessionCookie{}, ErrSessionCookieNoExpiry
-			}
-			stored.Expires = now.Add(time.Duration(cookie.MaxAge) * time.Second)
-		}
+	if cookie.MaxAge > 0 {
+		// Max-Age takes precedence over Expires for request-time cookies. Store
+		// its absolute deadline because restoration intentionally omits MaxAge.
+		stored.Expires = now.Add(time.Duration(cookie.MaxAge) * time.Second)
+	} else if stored.Expires.IsZero() {
+		stored.Expires = now.Add(ttl)
 	}
 	if err := validateSessionCookie(stored, now); err != nil {
 		return SessionCookie{}, err

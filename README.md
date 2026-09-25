@@ -87,7 +87,10 @@ seed. Session cookies without server expiry get a local 30-minute upper bound;
 revoked cookies still use normal recovery.
 
 An account-level OS lock serializes authentication across impersonation
-targets, while entries are target-specific. Processes must share the same
+targets, and server retry deadlines apply to that account across targets.
+Session cookies and ineffective-recovery cooldowns remain target-specific;
+an unusable cached generation is invalidated until its cooldown expires.
+Processes must share the same
 local directory for this to coordinate them. It cannot prevent OTP collisions
 with browsers, other hosts, or independently configured controllers. Controller
 pods should leave caching disabled unless their storage and lifecycle have been

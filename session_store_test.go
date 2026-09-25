@@ -353,3 +353,50 @@ func TestNewSessionCookieWithBoundedTTL(t *testing.T) {
 		t.Fatalf("overlong TTL: error = %v, want no-expiry error", err)
 	}
 }
+
+func TestNewSessionCookieUsesMaxAgeOverExpires(t *testing.T) {
+	now := time.Date(2036, time.January, 2, 3, 4, 5, 0, time.UTC)
+	cookie, err := NewSessionCookie(http.Cookie{
+		Name:    "sessionid",
+		Value:   "value",
+		Path:    "/",
+		Expires: now.Add(-24 * time.Hour),
+		MaxAge:  60,
+	}, now)
+	if err != nil {
+		t.Fatalf("NewSessionCookie: %v", err)
+	}
+	wantExpiry := now.Add(time.Minute)
+	if !cookie.Expires.Equal(wantExpiry) {
+		t.Fatalf("expiry = %s, want Max-Age deadline %s", cookie.Expires, wantExpiry)
+	}
+	if cookie.LocalExpiry {
+		t.Fatal("Max-Age cookie was marked as a local expiry")
+	}
+
+	// Restoration must use the stored absolute deadline. Reapplying Max-Age
+	// here would extend the session on every process restart.
+	restored := cookie.ToHTTPCookie()
+	if restored.MaxAge != 0 {
+		t.Fatalf("restored MaxAge = %d, want omitted", restored.MaxAge)
+	}
+	if !restored.Expires.Equal(wantExpiry) {
+		t.Fatalf("restored expiry = %s, want %s", restored.Expires, wantExpiry)
+	}
+
+	persisted := cookie
+	persisted.Domain = "api.example.test"
+	persisted.HostOnly = true
+	restoredJar := NewTrackedCookieJar(nil)
+	restoredJar.now = func() time.Time { return now.Add(30 * time.Second) }
+	if err := restoredJar.Restore([]SessionCookie{persisted}); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	restoredCookies, err := restoredJar.PersistentCookies(now.Add(30 * time.Second))
+	if err != nil {
+		t.Fatalf("PersistentCookies after restore: %v", err)
+	}
+	if len(restoredCookies) != 1 || !restoredCookies[0].Expires.Equal(wantExpiry) {
+		t.Fatalf("restored tracked cookie = %#v, want expiry %s", restoredCookies, wantExpiry)
+	}
+}

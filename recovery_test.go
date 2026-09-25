@@ -3,6 +3,7 @@ package cloudsigma
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -274,19 +275,220 @@ func TestSessionCacheHonorsPersistedRetryDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := SessionKey{
-		Endpoint: f.baseURL(), Username: "user",
+		Endpoint: f.baseURL(), Username: "user", Impersonate: "target-a",
 		CredentialFingerprint: CredentialFingerprint(f.baseURL(), "user", "pass", "GEZD GNBV GY3T QOJQ"),
 	}
-	if err := store.Save(context.Background(), key, SessionRecord{RetryNotBefore: time.Now().Add(time.Minute)}); err != nil {
+	lock, err := store.LockAccount(context.Background(), key)
+	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = New(context.Background(), Config{BaseURL: f.baseURL(), Username: "user", Password: "pass", OTPSecret: "GEZD GNBV GY3T QOJQ", SessionCacheDir: dir})
+	if err := store.saveAccountRetry(context.Background(), key, time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	_ = lock.Close()
+	_, err = New(context.Background(), Config{BaseURL: f.baseURL(), Username: "user", Password: "pass", OTPSecret: "GEZD GNBV GY3T QOJQ", Impersonate: "target-b", SessionCacheDir: dir})
 	var authErr *AuthError
 	if !errors.As(err, &authErr) || authErr.Kind != AuthKindRateLimited {
 		t.Fatalf("New = %v, want cached rate-limit error", err)
 	}
 	if login, _, _ := f.counts(); login != 0 {
 		t.Fatalf("login calls = %d, want zero before retry deadline", login)
+	}
+}
+
+func TestRateLimitFromOneTargetBlocksAnother(t *testing.T) {
+	var mu sync.Mutex
+	logins := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		logins++
+		mu.Unlock()
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, "rate limited")
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	newTarget := func(target string) *refresher {
+		t.Helper()
+		auth, err := newAuthenticator(server.URL+"/api/2.0/", "user", "pass", "GEZD GNBV GY3T QOJQ", target, "", time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		auth.sleep = func(context.Context, time.Duration) error { return context.Canceled }
+		r := newRefresher(auth)
+		if err := r.configureStore(dir); err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	first := newTarget("target-a")
+	defer first.close()
+	if err := first.initialize(context.Background()); err == nil {
+		t.Fatal("first target should be rate limited")
+	}
+	second := newTarget("target-b")
+	defer second.close()
+	err := second.initialize(context.Background())
+	var authErr *AuthError
+	if !errors.As(err, &authErr) || authErr.Kind != AuthKindRateLimited {
+		t.Fatalf("second target = %v, want shared rate limit", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if logins != 1 {
+		t.Fatalf("login calls = %d, want one across targets", logins)
+	}
+}
+
+func TestIneffectiveRecoveryCooldownSurvivesRestart(t *testing.T) {
+	f := newFakeAPI(t)
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{BaseURL: f.baseURL(), Username: "user", Password: "pass", OTPSecret: "GEZD GNBV GY3T QOJQ", SessionCacheDir: dir}
+	client, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	f.mu.Lock()
+	f.alwaysUnauthorized = true
+	f.mu.Unlock()
+	err = client.Get(context.Background(), "protected/", nil)
+	var authErr *AuthError
+	if !errors.As(err, &authErr) || authErr.Kind != AuthKindPersistentSessionLoss {
+		t.Fatalf("first failure = %v", err)
+	}
+	_, err = New(context.Background(), cfg)
+	if !errors.As(err, &authErr) || authErr.Kind != AuthKindPersistentSessionLoss {
+		t.Fatalf("restart = %v, want persistent cooldown", err)
+	}
+	if login, _, _ := f.counts(); login != 2 {
+		t.Fatalf("login calls = %d, want initial plus one recovery", login)
+	}
+}
+
+func TestLateFailedReplayCannotCoolDownNewGeneration(t *testing.T) {
+	var mu sync.Mutex
+	logins := 0
+	aReplayEntered := make(chan struct{})
+	releaseA := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.RawQuery, "do=login"):
+			mu.Lock()
+			logins++
+			session := logins
+			mu.Unlock()
+			http.SetCookie(w, &http.Cookie{Name: "sessionid", Value: fmt.Sprintf("s%d", session), Path: "/"})
+			_, _ = io.WriteString(w, `{}`)
+		case strings.Contains(r.URL.RawQuery, "do=verify_otp"):
+			_, _ = io.WriteString(w, `{}`)
+		case strings.HasSuffix(r.URL.Path, "/protected/"):
+			cookie, _ := r.Cookie("sessionid")
+			session := ""
+			if cookie != nil {
+				session = cookie.Value
+			}
+			flow := r.URL.Query().Get("flow")
+			if flow == "a" && session == "s2" {
+				close(aReplayEntered)
+				<-releaseA
+			}
+			if (flow == "b" && session == "s3") || (flow == "c" && session == "s4") {
+				_, _ = io.WriteString(w, `{"ok":true}`)
+				return
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, "expired")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := New(context.Background(), Config{BaseURL: server.URL + "/api/2.0/", Username: "user", Password: "pass", OTPSecret: "GEZD GNBV GY3T QOJQ"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	aResult := make(chan error, 1)
+	go func() { aResult <- client.Get(context.Background(), "protected/?flow=a", nil) }()
+	<-aReplayEntered
+	if err := client.Get(context.Background(), "protected/?flow=b", nil); err != nil {
+		t.Fatalf("newer recovery: %v", err)
+	}
+	close(releaseA)
+	var authErr *AuthError
+	if err := <-aResult; !errors.As(err, &authErr) || authErr.Kind != AuthKindPersistentSessionLoss {
+		t.Fatalf("late replay = %v", err)
+	}
+	if err := client.Get(context.Background(), "protected/?flow=c", nil); err != nil {
+		t.Fatalf("recovery after late replay: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if logins != 4 {
+		t.Fatalf("login calls = %d, want four generations", logins)
+	}
+}
+
+func TestIneffectiveReplayReservesGenerationWhilePersisting(t *testing.T) {
+	f := newFakeAPI(t)
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	client, err := New(context.Background(), Config{
+		BaseURL: f.baseURL(), Username: "user", Password: "pass",
+		OTPSecret: "GEZD GNBV GY3T QOJQ", SessionCacheDir: dir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := client.refresher
+	generation := r.currentGeneration()
+	lock, err := r.store.LockAccount(context.Background(), r.storeKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure := &AuthError{Stage: AuthStageSessionRecovery, Kind: AuthKindPersistentSessionLoss}
+	noted := make(chan error, 1)
+	go func() { noted <- r.noteIneffective(generation, failure) }()
+	deadline := time.After(5 * time.Second)
+	for {
+		r.mu.Lock()
+		reserved := r.inFlight != nil
+		r.mu.Unlock()
+		if reserved {
+			break
+		}
+		select {
+		case <-deadline:
+			_ = lock.Close()
+			t.Fatal("ineffective replay did not reserve its generation")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	refreshResult := make(chan error, 1)
+	go func() { refreshResult <- r.refresh(context.Background(), generation) }()
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-noted; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-refreshResult; !errors.Is(err, failure) {
+		t.Fatalf("concurrent recovery = %v, want ineffective replay failure", err)
+	}
+	if logins, _, _ := f.counts(); logins != 1 {
+		t.Fatalf("login calls = %d, want no concurrent recovery login", logins)
 	}
 }
 

@@ -428,8 +428,9 @@ func (r *refresher) saveRecord(ctx context.Context, jar http.CookieJar, generati
 	})
 }
 
-func (r *refresher) saveCooldown(ctx context.Context, generation uint64) error {
-	_ = ctx // The retry deadline must survive cancellation of the waiting call.
+// saveRateLimit persists an account-wide server deadline even when the
+// original caller stopped waiting for that deadline.
+func (r *refresher) saveRateLimit() error {
 	r.mu.Lock()
 	notBefore := r.notBefore
 	r.mu.Unlock()
@@ -438,15 +439,7 @@ func (r *refresher) saveCooldown(ctx context.Context, generation uint64) error {
 	}
 	persistCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	return r.store.Save(persistCtx, r.storeKey, SessionRecord{
-		Version:               currentSessionStoreVersion,
-		Endpoint:              r.storeKey.Endpoint,
-		Username:              r.storeKey.Username,
-		CredentialFingerprint: r.storeKey.CredentialFingerprint,
-		Impersonate:           r.storeKey.Impersonate,
-		Generation:            generation,
-		RetryNotBefore:        notBefore,
-	})
+	return r.store.saveAccountRetry(persistCtx, r.storeKey, notBefore)
 }
 
 func (r *refresher) initialize(ctx context.Context) error {
@@ -483,11 +476,18 @@ func (r *refresher) initialize(ctx context.Context) error {
 		return err
 	}
 	if remaining := record.RetryNotBefore.Sub(r.auth.now()); remaining > 0 {
+		return &AuthError{Stage: AuthStageSessionRecovery, Kind: AuthKindPersistentSessionLoss, RetryAfter: remaining}
+	}
+	accountDeadline, err := r.store.loadAccountRetry(ctx, r.storeKey)
+	if err != nil {
+		return err
+	}
+	if remaining := accountDeadline.Sub(r.auth.now()); remaining > 0 {
 		return &AuthError{Stage: AuthStageLogin, Kind: AuthKindRateLimited, RetryAfter: remaining}
 	}
 	jar, err := r.login(ctx)
 	if err != nil {
-		if saveErr := r.saveCooldown(ctx, record.Generation); saveErr != nil {
+		if saveErr := r.saveRateLimit(); saveErr != nil {
 			return saveErr
 		}
 		return err
@@ -639,11 +639,18 @@ func (r *refresher) recover(ctx context.Context, seen uint64) (http.CookieJar, u
 		return nil, 0, loadErr
 	}
 	if remaining := record.RetryNotBefore.Sub(r.auth.now()); remaining > 0 {
+		return nil, 0, &AuthError{Stage: AuthStageSessionRecovery, Kind: AuthKindPersistentSessionLoss, RetryAfter: remaining}
+	}
+	accountDeadline, err := r.store.loadAccountRetry(ctx, r.storeKey)
+	if err != nil {
+		return nil, 0, err
+	}
+	if remaining := accountDeadline.Sub(r.auth.now()); remaining > 0 {
 		return nil, 0, &AuthError{Stage: AuthStageSessionRecovery, Kind: AuthKindRateLimited, RetryAfter: remaining}
 	}
 	jar, err := r.login(ctx)
 	if err != nil {
-		if saveErr := r.saveCooldown(ctx, record.Generation); saveErr != nil {
+		if saveErr := r.saveRateLimit(); saveErr != nil {
 			return nil, 0, saveErr
 		}
 		return nil, 0, err
@@ -737,11 +744,68 @@ func (r *refresher) transport() http.RoundTripper {
 	}
 }
 
-func (r *refresher) noteIneffective(err error) {
+func (r *refresher) noteIneffective(generation uint64, failure error) (result error) {
 	r.mu.Lock()
-	r.lastErr = err
-	r.lastFailureAt = r.auth.now()
+	if r.generation != generation || r.inFlight != nil {
+		r.mu.Unlock()
+		return nil
+	}
+	// Reserve this generation before taking the account lock. A newer local
+	// recovery must wait until the marker has either been published or skipped.
+	done := make(chan struct{})
+	r.inFlight = done
 	r.mu.Unlock()
+	now := r.auth.now()
+	deadline := now.Add(r.cooldown)
+	applyCooldown := true
+	defer func() {
+		r.mu.Lock()
+		if applyCooldown {
+			r.lastErr = failure
+			r.lastFailureAt = now
+			r.notBefore = deadline
+		} else {
+			r.lastErr = result
+		}
+		r.inFlight = nil
+		close(done)
+		r.mu.Unlock()
+	}()
+	if r.store != nil {
+		lifetime := r.lifetime
+		if lifetime == nil {
+			lifetime = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(lifetime, r.auth.timeout+35*time.Second)
+		defer cancel()
+		lock, err := r.store.LockAccount(ctx, r.storeKey)
+		if err != nil {
+			applyCooldown = false
+			return err
+		}
+		defer lock.Close()
+		record, err := r.store.Load(ctx, r.storeKey)
+		if errors.Is(err, ErrSessionCacheNotFound) || errors.Is(err, ErrSessionCacheCredentialMismatch) || errors.Is(err, ErrSessionExpired) {
+			return nil
+		}
+		if err != nil {
+			applyCooldown = false
+			return err
+		}
+		// A different process may have published a newer session while this
+		// replay was in flight. Never invalidate or cool down that generation.
+		if record.Generation != generation {
+			applyCooldown = false
+			return nil
+		}
+		record.Cookies = nil
+		record.RetryNotBefore = deadline
+		if err := r.store.Save(ctx, r.storeKey, record); err != nil {
+			applyCooldown = false
+			return err
+		}
+	}
+	return nil
 }
 
 // refreshTransport watches for session loss, re-logs-in through the shared
@@ -754,7 +818,7 @@ type refreshTransport struct {
 	snapshot        func() (uint64, http.CookieJar)
 	origin          string
 	impersonate     bool
-	noteIneffective func(error)
+	noteIneffective func(uint64, error) error
 	onEvent         AuthEventHandler
 }
 
@@ -794,7 +858,7 @@ func (t *refreshTransport) RoundTrip(request *http.Request) (*http.Response, err
 		Outcome: authEventOutcomeSuccess,
 	})
 
-	_, jar = t.snapshot()
+	replayGeneration, jar := t.snapshot()
 	retried, err := t.attempt(request, body, jar)
 	if err != nil {
 		return nil, err
@@ -805,7 +869,9 @@ func (t *refreshTransport) RoundTrip(request *http.Request) (*http.Response, err
 		// otherwise follow the Location and fetch the login page.
 		authErr := classifyAuthError(AuthStageSessionRecovery, sessionLossError(request, retried))
 		if t.noteIneffective != nil {
-			t.noteIneffective(authErr)
+			if err := t.noteIneffective(replayGeneration, authErr); err != nil {
+				return nil, err
+			}
 		}
 		return nil, authErr
 	}
