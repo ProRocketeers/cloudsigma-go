@@ -744,7 +744,7 @@ func (r *refresher) transport() http.RoundTripper {
 	}
 }
 
-func (r *refresher) noteIneffective(generation uint64, failure error) (result error) {
+func (r *refresher) noteIneffective(ctx context.Context, generation uint64, failure error) error {
 	r.mu.Lock()
 	if r.generation != generation || r.inFlight != nil {
 		r.mu.Unlock()
@@ -755,6 +755,17 @@ func (r *refresher) noteIneffective(generation uint64, failure error) (result er
 	done := make(chan struct{})
 	r.inFlight = done
 	r.mu.Unlock()
+	result := make(chan error, 1)
+	go func() { result <- r.persistIneffective(generation, failure, done) }()
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *refresher) persistIneffective(generation uint64, failure error, done chan struct{}) (result error) {
 	now := r.auth.now()
 	deadline := now.Add(r.cooldown)
 	applyCooldown := true
@@ -772,11 +783,9 @@ func (r *refresher) noteIneffective(generation uint64, failure error) (result er
 		r.mu.Unlock()
 	}()
 	if r.store != nil {
-		lifetime := r.lifetime
-		if lifetime == nil {
-			lifetime = context.Background()
-		}
-		ctx, cancel := context.WithTimeout(lifetime, r.auth.timeout+35*time.Second)
+		// Persistence has its own deadline: cancellation or Close must not
+		// leave a failed generation reusable by the next process.
+		ctx, cancel := context.WithTimeout(context.Background(), r.auth.timeout+35*time.Second)
 		defer cancel()
 		lock, err := r.store.LockAccount(ctx, r.storeKey)
 		if err != nil {
@@ -818,7 +827,7 @@ type refreshTransport struct {
 	snapshot        func() (uint64, http.CookieJar)
 	origin          string
 	impersonate     bool
-	noteIneffective func(uint64, error) error
+	noteIneffective func(context.Context, uint64, error) error
 	onEvent         AuthEventHandler
 }
 
@@ -869,7 +878,7 @@ func (t *refreshTransport) RoundTrip(request *http.Request) (*http.Response, err
 		// otherwise follow the Location and fetch the login page.
 		authErr := classifyAuthError(AuthStageSessionRecovery, sessionLossError(request, retried))
 		if t.noteIneffective != nil {
-			if err := t.noteIneffective(replayGeneration, authErr); err != nil {
+			if err := t.noteIneffective(request.Context(), replayGeneration, authErr); err != nil {
 				return nil, err
 			}
 		}

@@ -104,7 +104,7 @@ func (j *TrackedCookieJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
 			path = defaultCookiePath(u)
 		}
 		key := trackedCookieKey{name: copyCookie.Name, domain: domain, path: path}
-		if copyCookie.MaxAge < 0 || (!copyCookie.Expires.IsZero() && !copyCookie.Expires.After(now)) {
+		if copyCookie.MaxAge < 0 || (copyCookie.MaxAge <= 0 && !copyCookie.Expires.IsZero() && !copyCookie.Expires.After(now)) {
 			remove = append(remove, key)
 			continue
 		}

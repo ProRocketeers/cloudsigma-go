@@ -459,7 +459,7 @@ func TestIneffectiveReplayReservesGenerationWhilePersisting(t *testing.T) {
 	}
 	failure := &AuthError{Stage: AuthStageSessionRecovery, Kind: AuthKindPersistentSessionLoss}
 	noted := make(chan error, 1)
-	go func() { noted <- r.noteIneffective(generation, failure) }()
+	go func() { noted <- r.noteIneffective(context.Background(), generation, failure) }()
 	deadline := time.After(5 * time.Second)
 	for {
 		r.mu.Lock()
@@ -489,6 +489,82 @@ func TestIneffectiveReplayReservesGenerationWhilePersisting(t *testing.T) {
 	}
 	if logins, _, _ := f.counts(); logins != 1 {
 		t.Fatalf("login calls = %d, want no concurrent recovery login", logins)
+	}
+}
+
+func TestCanceledReplayDoesNotWaitForCooldownPersistence(t *testing.T) {
+	f := newFakeAPI(t)
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	client, err := New(context.Background(), Config{
+		BaseURL: f.baseURL(), Username: "user", Password: "pass",
+		OTPSecret: "GEZD GNBV GY3T QOJQ", SessionCacheDir: dir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := client.refresher
+	generation := r.currentGeneration()
+	lock, err := r.store.LockAccount(context.Background(), r.storeKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	failure := &AuthError{Stage: AuthStageSessionRecovery, Kind: AuthKindPersistentSessionLoss}
+	go func() { result <- r.noteIneffective(ctx, generation, failure) }()
+	deadline := time.After(5 * time.Second)
+	for {
+		r.mu.Lock()
+		reserved := r.inFlight != nil
+		r.mu.Unlock()
+		if reserved {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("ineffective replay did not begin persistence")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled caller = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled caller waited for the account lock")
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.After(5 * time.Second)
+	for {
+		r.mu.Lock()
+		pending := r.inFlight != nil
+		r.mu.Unlock()
+		if !pending {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("cooldown persistence did not complete")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	record, err := r.store.Load(context.Background(), r.storeKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(record.Cookies) != 0 || !record.RetryNotBefore.After(time.Now()) {
+		t.Fatalf("persisted record = %#v, want invalidated session and future retry deadline", record)
 	}
 }
 

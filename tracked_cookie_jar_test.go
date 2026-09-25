@@ -98,6 +98,31 @@ func TestTrackedCookieJarDeletionAndExpiry(t *testing.T) {
 	}
 }
 
+func TestTrackedCookieJarSetCookiesUsesPositiveMaxAgeOverExpiredExpires(t *testing.T) {
+	now := time.Date(2036, time.January, 2, 3, 4, 5, 0, time.UTC)
+	tracked := NewTrackedCookieJar(nil)
+	tracked.now = func() time.Time { return now }
+	endpoint, _ := url.Parse("https://api.example.test/login/")
+	tracked.SetCookies(endpoint, []*http.Cookie{{
+		Name:    "sessionid",
+		Value:   "session",
+		Path:    "/",
+		Expires: now.Add(-time.Hour),
+		MaxAge:  60,
+	}})
+
+	cookies, err := tracked.PersistentCookies(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cookies) != 1 {
+		t.Fatalf("tracked cookies = %d, want one cookie", len(cookies))
+	}
+	if want := now.Add(time.Minute); !cookies[0].Expires.Equal(want) {
+		t.Fatalf("tracked expiry = %s, want Max-Age deadline %s", cookies[0].Expires, want)
+	}
+}
+
 func TestTrackedCookieJarRejectsUnboundedTTL(t *testing.T) {
 	if _, err := NewTrackedCookieJarWithTTL(nil, 0); err == nil {
 		t.Fatal("zero TTL returned nil error")
