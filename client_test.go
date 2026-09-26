@@ -48,6 +48,7 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/2.0/accounts/action/", f.handleAccount)
 	mux.HandleFunc("/api/2.0/protected/", f.handleProtected)
+	mux.HandleFunc("/api/2.0/drives/", f.handleProtected)
 	mux.HandleFunc("/api/2.0/status/", f.handleStatus)
 	mux.HandleFunc("/api/2.0/blob/", f.handleBlob)
 	mux.HandleFunc("/accounts/login/", func(w http.ResponseWriter, _ *http.Request) {
