@@ -632,3 +632,51 @@ func TestAuthEventsIncludeInitialHandshakeAndRecovery(t *testing.T) {
 		t.Fatalf("events = %#v, want handshake and recovery", events)
 	}
 }
+
+func TestStaleCachedSessionParallelBurstRecovers(t *testing.T) {
+	f := newFakeAPI(t)
+	cacheDir := t.TempDir()
+	if err := os.Chmod(cacheDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		BaseURL: f.baseURL(), Username: "user", Password: "pass",
+		OTPSecret: "GEZD GNBV GY3T QOJQ", SessionCacheDir: cacheDir,
+	}
+	first, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Close()
+	f.expire() // the cached cookie died overnight
+
+	second, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	login, _, probes := f.counts()
+	if login != 2 {
+		t.Fatalf("login calls after stale restore = %d, want 2 (re-login before first use)", login)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 46)
+	for i := 0; i < 46; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- second.Get(context.Background(), "protected/", nil)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("Get after stale cache: %v", err)
+		}
+	}
+	// No dead-cookie burst: each Get hits the API exactly once.
+	if login, _, protected := f.counts(); login != 2 || protected-probes != 46 {
+		t.Fatalf("login calls = %d, protected calls = %d, want 2 and 46", login, protected-probes)
+	}
+}

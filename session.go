@@ -442,6 +442,33 @@ func (r *refresher) saveRateLimit() error {
 	return r.store.saveAccountRetry(persistCtx, r.storeKey, notBefore)
 }
 
+// stillValid spends one GET checking a restored session before any caller
+// uses it. Without it a stale cache sends every parallel caller (Terraform
+// refreshes dozens of resources at once) to the API with a dead cookie, and
+// T-Cloud answers the login that follows that burst with 429 on every attempt.
+// Transport errors count as valid: the refresh transport still recovers later.
+func (r *refresher) stillValid(ctx context.Context, jar http.CookieJar) bool {
+	request, err := r.auth.newRequest(ctx, http.MethodGet, r.auth.root+sessionProbePath, nil, nil)
+	if err != nil {
+		return true
+	}
+	client := &http.Client{
+		Jar:           jar,
+		Timeout:       r.auth.timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return true
+	}
+	defer closeBody(response)
+	return !isSessionLossFor(response, r.auth.impersonate != "")
+}
+
+// sessionProbePath is a cheap authenticated read that works for impersonated
+// sessions too.
+const sessionProbePath = "drives/?limit=1"
+
 func (r *refresher) initialize(ctx context.Context) error {
 	if r.store == nil {
 		jar, err := r.login(ctx)
@@ -465,12 +492,17 @@ func (r *refresher) initialize(ctx context.Context) error {
 		if restoreErr != nil {
 			return restoreErr
 		}
-		r.mu.Lock()
-		r.jar = jar
-		r.generation = record.Generation
-		r.notBefore = record.RetryNotBefore
-		r.mu.Unlock()
-		return nil
+		if r.stillValid(ctx, jar) {
+			r.mu.Lock()
+			r.jar = jar
+			r.generation = record.Generation
+			r.notBefore = record.RetryNotBefore
+			r.mu.Unlock()
+			return nil
+		}
+		// The cached cookie died (typically overnight). Log in now, under the
+		// account lock, as an uncached client would.
+		record.Cookies = nil
 	}
 	if err != nil && !errors.Is(err, ErrSessionCacheNotFound) && !errors.Is(err, ErrSessionExpired) && !errors.Is(err, ErrSessionCacheCredentialMismatch) {
 		return err
