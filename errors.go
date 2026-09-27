@@ -183,10 +183,21 @@ func authRetryAfter(err error) time.Duration {
 	}
 	var responseErr *authAPIError
 	if errors.As(err, &responseErr) {
-		return responseErr.retryAfter
+		if responseErr.retryAfter > 0 {
+			return responseErr.retryAfter
+		}
+		// T-Cloud's lockout ("Too many failed authentication attempts. Please
+		// wait a minute before trying again.") sends no Retry-After. Retrying
+		// sooner only fails again inside the same window.
+		if strings.Contains(strings.ToLower(responseErr.Body), "wait a minute") {
+			return accountLockoutWait
+		}
 	}
 	return 0
 }
+
+// accountLockoutWait outlasts T-Cloud's one-minute authentication lockout.
+const accountLockoutWait = 61 * time.Second
 
 func parseRetryAfter(value string, now time.Time) time.Duration {
 	value = strings.TrimSpace(value)

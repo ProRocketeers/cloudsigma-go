@@ -652,7 +652,7 @@ func TestRateLimitedReloginBacksOffThenFailsFast(t *testing.T) {
 	f := newFakeAPI(t)
 	f.mu.Lock()
 	f.loginStatus = http.StatusTooManyRequests
-	f.loginBody = "too many failed authentication attempts, wait a minute"
+	f.loginBody = "too many requests"
 	f.mu.Unlock()
 
 	auth, err := newAuthenticator(f.baseURL(), "user", "pass", "GEZD GNBV GY3T QOJQ", "", "ua", time.Second)
@@ -878,5 +878,43 @@ func TestEndpoint(t *testing.T) {
 	}
 	if got := Endpoint("https://prg1.t-cloud.eu/api/2.0", ""); got != "prg1.t-cloud.eu/api/2.0/" {
 		t.Errorf("Endpoint scheme base = %q", got)
+	}
+}
+
+func TestAccountLockoutWaitsOutTheMinute(t *testing.T) {
+	f := newFakeAPI(t)
+	f.mu.Lock()
+	f.loginStatus = http.StatusTooManyRequests
+	// Verbatim T-Cloud response body; it carries no Retry-After header.
+	f.loginBody = `[{"error_type": "backend", "error_point": null, "error_message": "Too many failed authentication attempts. Please wait a minute before trying again."}]`
+	f.mu.Unlock()
+
+	auth, err := newAuthenticator(f.baseURL(), "user", "pass", "GEZD GNBV GY3T QOJQ", "", "ua", time.Second)
+	if err != nil {
+		t.Fatalf("newAuthenticator: %v", err)
+	}
+	var sleeps []time.Duration
+	now := time.Unix(1_700_000_000, 0)
+	auth.now = func() time.Time { return now }
+	auth.sleep = func(_ context.Context, d time.Duration) error {
+		sleeps = append(sleeps, d)
+		now = now.Add(d)
+		if len(sleeps) == 1 {
+			f.mu.Lock()
+			f.loginStatus = 0 // lockout over
+			f.mu.Unlock()
+		}
+		return nil
+	}
+
+	refresher := &refresher{auth: auth, maxAttempts: 4, baseDelay: time.Second, maxDelay: 8 * time.Second}
+	if err := refresher.refresh(context.Background(), refresher.currentGeneration()); err != nil {
+		t.Fatalf("refresh after lockout: %v", err)
+	}
+	if len(sleeps) != 1 || sleeps[0] < time.Minute {
+		t.Fatalf("sleeps = %v, want one wait of at least a minute", sleeps)
+	}
+	if login, _, _ := f.counts(); login != 2 {
+		t.Fatalf("login attempts = %d, want 2", login)
 	}
 }
