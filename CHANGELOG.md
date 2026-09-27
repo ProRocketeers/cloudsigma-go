@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/ProRocketeers/cloudsigma-go/compare/v0.3.0...v0.3.1) (2026-09-27)
+
+
+### Bug Fixes
+
+* stale session cache trips T-Cloud's auth lockout ([#3](https://github.com/ProRocketeers/cloudsigma-go/issues/3)) ([84cbee0](https://github.com/ProRocketeers/cloudsigma-go/commit/84cbee0e625ba0a0b30beff6053a9466b35aab20))
+
 ## [0.3.0](https://github.com/ProRocketeers/cloudsigma-go/compare/v0.2.0...v0.3.0) (2026-09-25)
 
 
