@@ -334,6 +334,10 @@ func (s *FileSessionStore) Lock(ctx context.Context, key SessionLockKey) (*Sessi
 	if err := contextErr(ctx); err != nil {
 		return nil, err
 	}
+	if key.Scope == SessionLockAccount {
+		key.Endpoint = normalizedAuthEndpoint(key.Endpoint)
+		key.Username = strings.ToLower(strings.TrimSpace(key.Username))
+	}
 	if err := key.validate(); err != nil {
 		return nil, err
 	}
@@ -376,8 +380,8 @@ func (s *FileSessionStore) Lock(ctx context.Context, key SessionLockKey) (*Sessi
 // identity, including different impersonation targets.
 func (s *FileSessionStore) LockAccount(ctx context.Context, key SessionKey) (*SessionLock, error) {
 	return s.Lock(ctx, SessionLockKey{
-		Endpoint: normalizedAuthEndpoint(key.Endpoint),
-		Username: strings.ToLower(strings.TrimSpace(key.Username)),
+		Endpoint: key.Endpoint,
+		Username: key.Username,
 		Scope:    SessionLockAccount,
 	})
 }

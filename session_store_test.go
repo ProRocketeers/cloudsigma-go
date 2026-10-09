@@ -288,6 +288,13 @@ func TestFileSessionStoreLocksSeparateScopesAndHonorsContext(t *testing.T) {
 	if _, err := store.LockAccount(ctx, other); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("same account lock: error = %v, want context deadline", err)
 	}
+	ctx, cancel = context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := store.Lock(ctx, SessionLockKey{
+		Endpoint: "HTTPS://API.EXAMPLE.TEST:443/api/2.0/", Username: "USER@EXAMPLE.TEST", Scope: SessionLockAccount,
+	}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("direct account-scope lock: error = %v, want normalized account lock contention", err)
+	}
 
 	entryA, err := store.LockEntry(context.Background(), key)
 	if err != nil {

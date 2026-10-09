@@ -55,8 +55,9 @@ var (
 )
 
 type sessionCacheCall struct {
-	done chan struct{}
-	err  error
+	done            chan struct{}
+	err             error
+	ownerContextErr error
 }
 
 // Login performs the login + verify_otp handshake and returns an http.Client
@@ -95,7 +96,15 @@ func LoginWithOptions(ctx context.Context, baseURL, username, password, otpSecre
 				sessionMu.Unlock()
 				select {
 				case <-pending.done:
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					if pending.err != nil {
+						if pending.ownerContextErr != nil && (errors.Is(pending.err, context.Canceled) || errors.Is(pending.err, context.DeadlineExceeded)) {
+							// A canceled leader must not poison active callers that
+							// were sharing its initialization.
+							continue
+						}
 						return nil, pending.err
 					}
 					continue
@@ -118,6 +127,7 @@ func LoginWithOptions(ctx context.Context, baseURL, username, password, otpSecre
 				sessionCache[key] = cachedClient
 			}
 			cacheCall.err = cacheCallErr
+			cacheCall.ownerContextErr = ctx.Err()
 			delete(sessionCacheCalls, key)
 			close(cacheCall.done)
 			sessionMu.Unlock()

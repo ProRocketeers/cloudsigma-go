@@ -947,6 +947,91 @@ func TestLoginCache(t *testing.T) {
 	}
 }
 
+func TestLoginWaiterRetriesAfterSharedLeaderCancellation(t *testing.T) {
+	var mu sync.Mutex
+	loginCalls, verifyCalls := 0, 0
+	firstLoginEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseFirstHandler := func() { releaseOnce.Do(func() { close(releaseFirst) }) }
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("do") {
+		case "login":
+			mu.Lock()
+			loginCalls++
+			attempt := loginCalls
+			mu.Unlock()
+			if attempt == 1 {
+				close(firstLoginEntered)
+				select {
+				case <-r.Context().Done():
+				case <-releaseFirst:
+				}
+				return
+			}
+			http.SetCookie(w, &http.Cookie{Name: "csrftoken", Value: "csrf", Path: "/"})
+			_, _ = io.WriteString(w, `{}`)
+		case "verify_otp":
+			mu.Lock()
+			verifyCalls++
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	defer releaseFirstHandler()
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderResult := make(chan error, 1)
+	go func() {
+		_, err := LoginWithOptions(leaderCtx, server.URL+"/api/2.0/", t.Name(), "pass", testOTPSecret, "", "", LoginOptions{})
+		leaderResult <- err
+	}()
+	<-firstLoginEntered
+
+	waiterBase, cancelWaiter := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelWaiter()
+	observedWait := make(chan struct{})
+	waiterCtx := &observedDoneContext{Context: waiterBase, entered: observedWait}
+	waiterResult := make(chan *http.Client, 1)
+	waiterErr := make(chan error, 1)
+	go func() {
+		client, err := LoginWithOptions(waiterCtx, server.URL+"/api/2.0/", t.Name(), "pass", testOTPSecret, "", "", LoginOptions{})
+		waiterResult <- client
+		waiterErr <- err
+	}()
+	<-observedWait // the second caller is blocked on the leader's shared call
+	cancelLeader()
+	releaseFirstHandler()
+	if err := <-leaderResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("leader result = %v, want cancellation", err)
+	}
+	if err := <-waiterErr; err != nil {
+		t.Fatalf("uncanceled waiter inherited leader cancellation: %v", err)
+	}
+	if client := <-waiterResult; client == nil {
+		t.Fatal("uncanceled waiter received a nil client")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if loginCalls != 2 || verifyCalls != 1 {
+		t.Fatalf("login/OTP calls = %d/%d, want canceled leader plus one successful retry", loginCalls, verifyCalls)
+	}
+}
+
+type observedDoneContext struct {
+	context.Context
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (c *observedDoneContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.entered) })
+	return c.Context.Done()
+}
+
 func TestEndpoint(t *testing.T) {
 	if got := Endpoint("", "zrh"); got != "zrh.cloudsigma.com/api/2.0/" {
 		t.Errorf("Endpoint empty base = %q", got)
