@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/ProRocketeers/cloudsigma-go/compare/v0.3.1...v0.4.0) (2026-10-09)
+
+
+### Features
+
+* improve auth TOTP handling ([#5](https://github.com/ProRocketeers/cloudsigma-go/issues/5)) ([b8d4633](https://github.com/ProRocketeers/cloudsigma-go/commit/b8d46334ddc0334d750a889c3d35e2c0aa79b14e))
+
 ## [0.3.1](https://github.com/ProRocketeers/cloudsigma-go/compare/v0.3.0...v0.3.1) (2026-09-27)
 
 
