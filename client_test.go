@@ -10,14 +10,18 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
+var testAccountCounter atomic.Uint64
+
 // fakeAPI is an httptest-backed CloudSigma stand-in. Every counter and knob is
 // mutex-guarded so the concurrency tests are race-clean.
 type fakeAPI struct {
-	srv *httptest.Server
+	srv  *httptest.Server
+	user string
 
 	mu             sync.Mutex
 	loginCalls     int
@@ -44,7 +48,7 @@ type fakeAPI struct {
 
 func newFakeAPI(t *testing.T) *fakeAPI {
 	t.Helper()
-	f := &fakeAPI{}
+	f := &fakeAPI{user: fmt.Sprintf("test-%d@example.test", testAccountCounter.Add(1))}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/2.0/accounts/action/", f.handleAccount)
 	mux.HandleFunc("/api/2.0/protected/", f.handleProtected)
@@ -207,7 +211,7 @@ func (f *fakeAPI) newClient(t *testing.T) *Client {
 	t.Helper()
 	client, err := New(context.Background(), Config{
 		BaseURL:   f.baseURL(),
-		Username:  "user@example.com",
+		Username:  f.user,
 		Password:  "secret-password",
 		OTPSecret: "GEZD GNBV GY3T QOJQ",
 		UserAgent: "cloudsigma-go-test/1.0",
@@ -215,7 +219,75 @@ func (f *fakeAPI) newClient(t *testing.T) *Client {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	installFastOTPClock(client.refresher.auth)
 	return client
+}
+
+func installFastOTPClock(auth *authenticator) {
+	installTestOTPClock(auth, time.Now())
+}
+
+type testOTPClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func installTestOTPClock(auth *authenticator, start time.Time) *testOTPClock {
+	clock := &testOTPClock{now: start}
+	auth.now = clock.Now
+	auth.sleep = clock.Sleep
+	return clock
+}
+
+func (c *testOTPClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *testOTPClock) Advance(delay time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(delay)
+	c.mu.Unlock()
+}
+
+func (c *testOTPClock) Sleep(ctx context.Context, delay time.Duration) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.now = c.now.Add(delay)
+	c.mu.Unlock()
+	return contextErr(ctx)
+}
+
+func newTestClientWithFastClock(ctx context.Context, cfg Config) (*Client, error) {
+	return newTestClientWithClock(ctx, cfg, time.Now())
+}
+
+func newTestClientWithClock(ctx context.Context, cfg Config, now time.Time) (*Client, error) {
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	auth, err := newAuthenticatorWithEvents(cfg.BaseURL, cfg.Username, cfg.Password, cfg.OTPSecret, cfg.Impersonate, cfg.UserAgent, timeout, cfg.OnAuthEvent)
+	if err != nil {
+		return nil, err
+	}
+	installTestOTPClock(auth, now)
+	refresher := newRefresher(auth)
+	if err := refresher.configureStore(cfg.SessionCacheDir); err != nil {
+		return nil, err
+	}
+	if err := refresher.initialize(ctx); err != nil {
+		return nil, err
+	}
+	_, jar := refresher.snapshot()
+	return &Client{
+		http:      &http.Client{Jar: jar, Timeout: timeout, Transport: refresher.transport()},
+		base:      auth.root,
+		refresher: refresher,
+	}, nil
 }
 
 func TestNewHandshakeHappyPath(t *testing.T) {
@@ -566,7 +638,7 @@ func TestFailedRefreshCooldown(t *testing.T) {
 	f.loginBody = "bad credentials"
 	f.mu.Unlock()
 
-	auth, err := newAuthenticator(f.baseURL(), "user", "pass", "GEZD GNBV GY3T QOJQ", "", "ua", time.Second)
+	auth, err := newAuthenticator(f.baseURL(), t.Name(), "pass", "GEZD GNBV GY3T QOJQ", "", "ua", time.Second)
 	if err != nil {
 		t.Fatalf("newAuthenticator: %v", err)
 	}
@@ -613,7 +685,7 @@ func TestSuccessfulRefreshShortCircuitsAndClearsCooldown(t *testing.T) {
 	f.loginBody = "bad credentials"
 	f.mu.Unlock()
 
-	auth, err := newAuthenticator(f.baseURL(), "user", "pass", "GEZD GNBV GY3T QOJQ", "", "ua", time.Second)
+	auth, err := newAuthenticator(f.baseURL(), t.Name(), "pass", "GEZD GNBV GY3T QOJQ", "", "ua", time.Second)
 	if err != nil {
 		t.Fatalf("newAuthenticator: %v", err)
 	}
@@ -655,7 +727,7 @@ func TestRateLimitedReloginBacksOffThenFailsFast(t *testing.T) {
 	f.loginBody = "too many requests"
 	f.mu.Unlock()
 
-	auth, err := newAuthenticator(f.baseURL(), "user", "pass", "GEZD GNBV GY3T QOJQ", "", "ua", time.Second)
+	auth, err := newAuthenticator(f.baseURL(), t.Name(), "pass", "GEZD GNBV GY3T QOJQ", "", "ua", time.Second)
 	if err != nil {
 		t.Fatalf("newAuthenticator: %v", err)
 	}
@@ -696,7 +768,7 @@ func TestBadCredentialsFailFast(t *testing.T) {
 	f.loginBody = "bad credentials"
 	f.mu.Unlock()
 
-	auth, err := newAuthenticator(f.baseURL(), "user", "pass", "GEZD GNBV GY3T QOJQ", "", "ua", time.Second)
+	auth, err := newAuthenticator(f.baseURL(), t.Name(), "pass", "GEZD GNBV GY3T QOJQ", "", "ua", time.Second)
 	if err != nil {
 		t.Fatalf("newAuthenticator: %v", err)
 	}
@@ -839,16 +911,19 @@ func TestLoginCache(t *testing.T) {
 	f := newFakeAPI(t)
 	ctx := context.Background()
 
-	first, err := Login(ctx, f.baseURL(), "user@example.com", "secret", "GEZD GNBV GY3T QOJQ", "", "ua")
+	first, err := Login(ctx, f.baseURL(), f.user, "secret", "GEZD GNBV GY3T QOJQ", "", "ua")
 	if err != nil {
 		t.Fatalf("first Login: %v", err)
 	}
-	second, err := Login(ctx, f.baseURL(), "user@example.com", "secret", "GEZD GNBV GY3T QOJQ", "", "ua")
+	second, err := Login(ctx, f.baseURL(), f.user, "secret", "GEZD GNBV GY3T QOJQ", "", "ua")
 	if err != nil {
 		t.Fatalf("second Login: %v", err)
 	}
 	if first != second {
 		t.Error("Login returned two different clients for the same credentials")
+	}
+	if transport, ok := first.Transport.(*refreshTransport); ok {
+		installFastOTPClock(transport.auth)
 	}
 	if login, verify, _ := f.counts(); login != 1 || verify != 1 {
 		t.Errorf("handshake counts login=%d verify=%d, want 1/1 (cached)", login, verify)
@@ -872,6 +947,91 @@ func TestLoginCache(t *testing.T) {
 	}
 }
 
+func TestLoginWaiterRetriesAfterSharedLeaderCancellation(t *testing.T) {
+	var mu sync.Mutex
+	loginCalls, verifyCalls := 0, 0
+	firstLoginEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseFirstHandler := func() { releaseOnce.Do(func() { close(releaseFirst) }) }
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("do") {
+		case "login":
+			mu.Lock()
+			loginCalls++
+			attempt := loginCalls
+			mu.Unlock()
+			if attempt == 1 {
+				close(firstLoginEntered)
+				select {
+				case <-r.Context().Done():
+				case <-releaseFirst:
+				}
+				return
+			}
+			http.SetCookie(w, &http.Cookie{Name: "csrftoken", Value: "csrf", Path: "/"})
+			_, _ = io.WriteString(w, `{}`)
+		case "verify_otp":
+			mu.Lock()
+			verifyCalls++
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	defer releaseFirstHandler()
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderResult := make(chan error, 1)
+	go func() {
+		_, err := LoginWithOptions(leaderCtx, server.URL+"/api/2.0/", t.Name(), "pass", testOTPSecret, "", "", LoginOptions{})
+		leaderResult <- err
+	}()
+	<-firstLoginEntered
+
+	waiterBase, cancelWaiter := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelWaiter()
+	observedWait := make(chan struct{})
+	waiterCtx := &observedDoneContext{Context: waiterBase, entered: observedWait}
+	waiterResult := make(chan *http.Client, 1)
+	waiterErr := make(chan error, 1)
+	go func() {
+		client, err := LoginWithOptions(waiterCtx, server.URL+"/api/2.0/", t.Name(), "pass", testOTPSecret, "", "", LoginOptions{})
+		waiterResult <- client
+		waiterErr <- err
+	}()
+	<-observedWait // the second caller is blocked on the leader's shared call
+	cancelLeader()
+	releaseFirstHandler()
+	if err := <-leaderResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("leader result = %v, want cancellation", err)
+	}
+	if err := <-waiterErr; err != nil {
+		t.Fatalf("uncanceled waiter inherited leader cancellation: %v", err)
+	}
+	if client := <-waiterResult; client == nil {
+		t.Fatal("uncanceled waiter received a nil client")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if loginCalls != 2 || verifyCalls != 1 {
+		t.Fatalf("login/OTP calls = %d/%d, want canceled leader plus one successful retry", loginCalls, verifyCalls)
+	}
+}
+
+type observedDoneContext struct {
+	context.Context
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (c *observedDoneContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.entered) })
+	return c.Context.Done()
+}
+
 func TestEndpoint(t *testing.T) {
 	if got := Endpoint("", "zrh"); got != "zrh.cloudsigma.com/api/2.0/" {
 		t.Errorf("Endpoint empty base = %q", got)
@@ -889,7 +1049,7 @@ func TestAccountLockoutWaitsOutTheMinute(t *testing.T) {
 	f.loginBody = `[{"error_type": "backend", "error_point": null, "error_message": "Too many failed authentication attempts. Please wait a minute before trying again."}]`
 	f.mu.Unlock()
 
-	auth, err := newAuthenticator(f.baseURL(), "user", "pass", "GEZD GNBV GY3T QOJQ", "", "ua", time.Second)
+	auth, err := newAuthenticator(f.baseURL(), t.Name(), "pass", "GEZD GNBV GY3T QOJQ", "", "ua", time.Second)
 	if err != nil {
 		t.Fatalf("newAuthenticator: %v", err)
 	}

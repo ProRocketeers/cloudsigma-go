@@ -21,10 +21,15 @@
 //
 // Errors are typed: AuthError reports stage, kind, wrapped cause, and retry
 // timing without printing server bodies; APIError remains available through
-// errors.As. Config.OnAuthEvent reports bounded authentication events. Optional
-// Config.SessionCacheDir enables private local session reuse for short-lived
-// processes; it is disabled by default. A response body larger than the read
-// cap yields ErrResponseTooLarge instead of a truncated payload.
+// errors.As. Config.OnAuthEvent reports bounded lifecycle events and one
+// request-attempt result for each SDK-issued login and OTP request, including
+// its observed HTTP status. Optional Config.SessionCacheDir enables private
+// local session reuse and cross-process accepted-OTP-step coordination for
+// processes sharing that directory; it is disabled by default. Independent
+// clients in one process coordinate accepted steps without disk storage.
+// Coordination is local and does not impose a production attempt quota. A
+// response body larger than the read cap yields ErrResponseTooLarge instead of
+// a truncated payload.
 //
 // The package uses only the Go standard library.
 package cloudsigma

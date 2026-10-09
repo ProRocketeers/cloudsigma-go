@@ -19,7 +19,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 )
 
 // loginResponseBytes caps handshake bodies. It stays much smaller than
@@ -30,12 +29,7 @@ const loginResponseBytes = 1 << 16
 // TOTP returns the RFC 6238 code for a base32 secret at time t.
 func TOTP(secret string, t time.Time) (string, error) {
 	// Authenticator apps display the secret in space-separated groups.
-	secret = strings.Map(func(r rune) rune {
-		if unicode.IsSpace(r) {
-			return -1
-		}
-		return unicode.ToUpper(r)
-	}, secret)
+	secret = normalizeOTPSecret(secret)
 
 	enc := base32.StdEncoding.WithPadding(base32.NoPadding)
 	key, err := enc.DecodeString(strings.TrimRight(secret, "="))
@@ -55,9 +49,16 @@ func TOTP(secret string, t time.Time) (string, error) {
 }
 
 var (
-	sessionMu    sync.Mutex
-	sessionCache = map[[32]byte]*http.Client{}
+	sessionMu         sync.Mutex
+	sessionCache      = map[[32]byte]*http.Client{}
+	sessionCacheCalls = map[[32]byte]*sessionCacheCall{}
 )
+
+type sessionCacheCall struct {
+	done            chan struct{}
+	err             error
+	ownerContextErr error
+}
 
 // Login performs the login + verify_otp handshake and returns an http.Client
 // whose requests carry the verified session and transparently re-authenticate
@@ -77,16 +78,60 @@ func Login(ctx context.Context, baseURL, username, password, otpSecret, imperson
 // not placed in Login's package cache: the cache predates per-caller event
 // handlers and must never silently suppress a requested callback.
 func LoginWithOptions(ctx context.Context, baseURL, username, password, otpSecret, impersonate, userAgent string, options LoginOptions) (*http.Client, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	key := sha256.Sum256([]byte(strings.Join([]string{baseURL, username, password, otpSecret, impersonate}, "\x00")))
 
 	cacheable := options.OnAuthEvent == nil && options.Timeout <= 0 && options.SessionCacheDir == ""
+	var cacheCall *sessionCacheCall
 	if cacheable {
-		sessionMu.Lock()
-		defer sessionMu.Unlock()
-		cached, ok := sessionCache[key]
-		if ok {
-			return cached, nil
+		for {
+			sessionMu.Lock()
+			if cached := sessionCache[key]; cached != nil {
+				sessionMu.Unlock()
+				return cached, nil
+			}
+			if pending := sessionCacheCalls[key]; pending != nil {
+				sessionMu.Unlock()
+				select {
+				case <-pending.done:
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+					if pending.err != nil {
+						if pending.ownerContextErr != nil && (errors.Is(pending.err, context.Canceled) || errors.Is(pending.err, context.DeadlineExceeded)) {
+							// A canceled leader must not poison active callers that
+							// were sharing its initialization.
+							continue
+						}
+						return nil, pending.err
+					}
+					continue
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			cacheCall = &sessionCacheCall{done: make(chan struct{})}
+			sessionCacheCalls[key] = cacheCall
+			sessionMu.Unlock()
+			break
 		}
+	}
+	var cachedClient *http.Client
+	var cacheCallErr error
+	if cacheable {
+		defer func() {
+			sessionMu.Lock()
+			if cachedClient != nil {
+				sessionCache[key] = cachedClient
+			}
+			cacheCall.err = cacheCallErr
+			cacheCall.ownerContextErr = ctx.Err()
+			delete(sessionCacheCalls, key)
+			close(cacheCall.done)
+			sessionMu.Unlock()
+		}()
 	}
 
 	timeout := options.Timeout
@@ -95,20 +140,23 @@ func LoginWithOptions(ctx context.Context, baseURL, username, password, otpSecre
 	}
 	auth, err := newAuthenticatorWithEvents(baseURL, username, password, otpSecret, impersonate, userAgent, timeout, options.OnAuthEvent)
 	if err != nil {
+		cacheCallErr = err
 		return nil, err
 	}
 	refresher := newRefresher(auth)
 	if err := refresher.configureStore(options.SessionCacheDir); err != nil {
+		cacheCallErr = err
 		return nil, err
 	}
 	if err := refresher.initialize(ctx); err != nil {
+		cacheCallErr = err
 		return nil, err
 	}
 
 	_, initialJar := refresher.snapshot()
 	client := &http.Client{Jar: initialJar, Timeout: auth.timeout, Transport: refresher.transport()}
 	if cacheable {
-		sessionCache[key] = client
+		cachedClient = client
 	}
 
 	return client, nil
@@ -134,6 +182,9 @@ type authenticator struct {
 	sleep   func(context.Context, time.Duration) error
 	now     func() time.Time
 	onEvent AuthEventHandler
+
+	beforeHandshake func(context.Context) error
+	acceptOTPStep   func(int64) error
 }
 
 func newAuthenticator(baseURL, username, password, otpSecret, impersonate, userAgent string, timeout time.Duration) (*authenticator, error) {
@@ -185,21 +236,27 @@ func (a *authenticator) handshake(ctx context.Context) error {
 		Reason:  authEventReasonInitial,
 		Outcome: authEventOutcomeStarted,
 	})
+	if a.beforeHandshake != nil {
+		if err := a.beforeHandshake(ctx); err != nil {
+			return a.finishHandshake(AuthStageLogin, err)
+		}
+	}
 
 	client := &http.Client{Jar: a.jar, Timeout: a.timeout}
 
 	body, _ := json.Marshal(map[string]string{"username": a.username, "password": a.password})
-	if _, err := a.doJSON(ctx, client, http.MethodPost, a.root+"accounts/action/?do=login", body, nil); err != nil {
+	if _, err := a.doJSON(ctx, client, http.MethodPost, a.root+"accounts/action/?do=login", body, nil, AuthStageLogin, 0); err != nil {
 		return a.finishHandshake(AuthStageLogin, err)
 	}
 
 	verify := func() error {
-		otp, err := TOTP(a.otp, a.now())
+		usedAt := a.now()
+		otp, err := TOTP(a.otp, usedAt)
 		if err != nil {
 			return err
 		}
 		headers := map[string]string{"OTP": otp, "X-CSRFToken": csrf(a.jar, a.apiURL)}
-		_, err = a.doJSON(ctx, client, http.MethodPost, a.root+"accounts/action/?do=verify_otp", []byte("{}"), headers)
+		_, err = a.doJSON(ctx, client, http.MethodPost, a.root+"accounts/action/?do=verify_otp", []byte("{}"), headers, AuthStageOTPVerification, usedAt.Unix()/30)
 		return err
 	}
 
@@ -309,7 +366,7 @@ func (a *authenticator) newRequest(ctx context.Context, method, url string, body
 	return request, nil
 }
 
-func (a *authenticator) doJSON(ctx context.Context, client *http.Client, method, url string, body []byte, headers map[string]string) ([]byte, error) {
+func (a *authenticator) doJSON(ctx context.Context, client *http.Client, method, url string, body []byte, headers map[string]string, stage AuthStage, otpStep int64) ([]byte, error) {
 	request, err := a.newRequest(ctx, method, url, body, headers)
 	if err != nil {
 		return nil, err
@@ -317,16 +374,23 @@ func (a *authenticator) doJSON(ctx context.Context, client *http.Client, method,
 
 	response, err := client.Do(request)
 	if err != nil {
+		status := 0
+		if response != nil {
+			status = response.StatusCode
+			closeBody(response)
+		}
+		a.emitAttemptResult(stage, status, err)
 		return nil, err
 	}
 	defer func() { _ = response.Body.Close() }()
 
 	payload, err := readCapped(response.Body, loginResponseBytes)
 	if err != nil {
+		a.emitAttemptResult(stage, response.StatusCode, err)
 		return nil, err
 	}
 	if response.StatusCode < 200 || response.StatusCode > 299 {
-		return nil, &authAPIError{
+		apiErr := &authAPIError{
 			APIError: &APIError{
 				StatusCode: response.StatusCode,
 				Body:       strings.TrimSpace(string(payload)),
@@ -335,8 +399,45 @@ func (a *authenticator) doJSON(ctx context.Context, client *http.Client, method,
 			},
 			retryAfter: parseRetryAfter(response.Header.Get("Retry-After"), a.now()),
 		}
+		a.emitAttemptResult(stage, response.StatusCode, apiErr)
+		return nil, apiErr
 	}
+	if stage == AuthStageOTPVerification && a.acceptOTPStep != nil {
+		if err := a.acceptOTPStep(otpStep); err != nil {
+			a.emitAttemptResult(stage, response.StatusCode, nil)
+			return nil, err
+		}
+	}
+	a.emitAttemptResult(stage, response.StatusCode, nil)
 	return payload, nil
+}
+
+func (a *authenticator) emitAttemptResult(stage AuthStage, status int, err error) {
+	if err == nil {
+		a.emit(AuthEvent{Type: AuthEventAttemptResult, Stage: stage, Reason: authEventReasonAuthentication, Outcome: authEventOutcomeSuccess, StatusCode: status})
+		return
+	}
+	reason := "transport"
+	if isRateLimited(err) {
+		reason = authEventReasonRateLimit
+	} else {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) {
+			switch apiErr.StatusCode {
+			case http.StatusBadRequest, http.StatusUnauthorized:
+				reason = "rejected"
+			case http.StatusForbidden:
+				reason = "permission_denied"
+			default:
+				if apiErr.StatusCode >= http.StatusInternalServerError {
+					reason = "server_error"
+				} else {
+					reason = "http_error"
+				}
+			}
+		}
+	}
+	a.emit(AuthEvent{Type: AuthEventAttemptResult, Stage: stage, Reason: reason, Outcome: authEventOutcomeFailure, StatusCode: status})
 }
 
 // refresher turns "the session is gone" into at most one in-flight login. The
@@ -701,12 +802,57 @@ func (r *refresher) recover(ctx context.Context, seen uint64) (http.CookieJar, u
 // backoff, and gives up after maxAttempts so a rejected credential fails fast
 // instead of looping forever.
 func (r *refresher) login(ctx context.Context) (http.CookieJar, error) {
-	var err error
+	accountIdentity := otpAccountIdentity(r.auth.root, r.auth.username)
+	release, err := acquireOTPAccount(ctx, accountIdentity)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	binding := otpSecretBinding(r.auth.otp)
+	stateIdentity := otpStateIdentity(r.auth.root, r.auth.username, binding)
 	for attempt := 0; attempt < r.maxAttempts; attempt++ {
 		candidate := *r.auth
 		tracked := NewTrackedCookieJar(nil)
 		tracked.now = r.auth.now
 		candidate.jar = tracked
+		candidate.beforeHandshake = func(waitCtx context.Context) error {
+			if err := contextErr(waitCtx); err != nil {
+				return err
+			}
+			accepted, known := acceptedOTPStep(stateIdentity)
+			if r.store != nil {
+				storedStep, stored, err := r.store.loadAcceptedOTPStep(waitCtx, r.storeKey, binding)
+				if err != nil {
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						return err
+					}
+					return fmt.Errorf("%w: %w", ErrOTPStateStorage, err)
+				}
+				if stored && (!known || storedStep > accepted) {
+					accepted, known = storedStep, true
+					rememberAcceptedOTPStep(stateIdentity, storedStep)
+				}
+			}
+			if known && r.auth.now().Unix()/30 <= accepted {
+				return waitForAcceptedOTPStep(waitCtx, r.auth.now, r.auth.sleep, accepted)
+			}
+			return contextErr(waitCtx)
+		}
+		candidate.acceptOTPStep = func(step int64) error {
+			// The server has accepted this code; retain the fact in-process even
+			// when private-cache persistence fails.
+			rememberAcceptedOTPStep(stateIdentity, step)
+			if r.store != nil {
+				if err := r.store.saveAcceptedOTPStep(ctx, r.storeKey, binding, step); err != nil {
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						return err
+					}
+					return fmt.Errorf("%w: %w", ErrOTPStateStorage, err)
+				}
+			}
+			return nil
+		}
 		err = candidate.handshake(ctx)
 		if err == nil {
 			r.mu.Lock()
@@ -767,6 +913,7 @@ func (r *refresher) backoff(attempt int) time.Duration {
 func (r *refresher) transport() http.RoundTripper {
 	return &refreshTransport{
 		base:            http.DefaultTransport,
+		auth:            r.auth,
 		refresh:         r.refresh,
 		snapshot:        r.snapshot,
 		origin:          r.auth.origin,
@@ -855,6 +1002,7 @@ func (r *refresher) persistIneffective(generation uint64, failure error, done ch
 // to retry.
 type refreshTransport struct {
 	base            http.RoundTripper
+	auth            *authenticator
 	refresh         func(context.Context, uint64) error
 	snapshot        func() (uint64, http.CookieJar)
 	origin          string
