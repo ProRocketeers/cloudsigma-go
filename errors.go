@@ -15,6 +15,11 @@ import (
 // silently truncating the body, so callers can detect it with errors.Is.
 var ErrResponseTooLarge = errors.New("cloudsigma: response body too large")
 
+// ErrOTPStateStorage reports that accepted-OTP coordination metadata could not
+// be read or safely persisted. Authentication fails closed rather than risk a
+// known OTP replay when local coordination is unavailable.
+var ErrOTPStateStorage = errors.New("cloudsigma: accepted OTP state storage failed")
+
 // readCapped reads at most limit bytes. When the body has more it returns
 // ErrResponseTooLarge rather than a truncated slice, so an oversized response
 // fails loudly instead of surfacing later as a confusing JSON syntax error.
@@ -68,6 +73,7 @@ const (
 	AuthKindRateLimited           AuthKind = "rate_limited"
 	AuthKindPersistentSessionLoss AuthKind = "persistent_session_loss"
 	AuthKindTransportFailure      AuthKind = "transport_failure"
+	AuthKindStorageFailure        AuthKind = "storage_failure"
 
 	// Compatibility aliases use the adjective-last names that read naturally
 	// at call sites while retaining one wire value for each kind.
@@ -133,7 +139,9 @@ func classifyAuthError(stage AuthStage, err error) *AuthError {
 	}
 
 	kind := AuthKindTransportFailure
-	if isRateLimited(err) {
+	if errors.Is(err, ErrOTPStateStorage) {
+		kind = AuthKindStorageFailure
+	} else if isRateLimited(err) {
 		kind = AuthKindRateLimited
 	} else {
 		var apiErr *APIError

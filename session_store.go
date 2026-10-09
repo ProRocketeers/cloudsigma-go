@@ -20,6 +20,7 @@ import (
 const (
 	currentSessionStoreVersion = 1
 	maxSessionRecordBytes      = 1 << 20
+	maxAcceptedOTPStep         = (1<<63 - 32) / 30
 	lockPollInterval           = 20 * time.Millisecond
 	// DefaultSessionCookieTTL bounds reuse of a session cookie that the server
 	// marked as a browser session cookie without persistent expiry.
@@ -179,6 +180,8 @@ type SessionRecord struct {
 	Cookies               []SessionCookie `json:"cookies"`
 	Generation            uint64          `json:"generation"`
 	RetryNotBefore        time.Time       `json:"retry_not_before,omitempty"`
+	AcceptedOTPStep       int64           `json:"accepted_otp_step,omitempty"`
+	OTPSecretBinding      string          `json:"otp_secret_binding,omitempty"`
 }
 
 // FileSessionStore stores opt-in sessions in a private local directory.
@@ -372,7 +375,11 @@ func (s *FileSessionStore) Lock(ctx context.Context, key SessionLockKey) (*Sessi
 // LockAccount serializes authentication for an endpoint and authenticating
 // identity, including different impersonation targets.
 func (s *FileSessionStore) LockAccount(ctx context.Context, key SessionKey) (*SessionLock, error) {
-	return s.Lock(ctx, SessionLockKey{Endpoint: key.Endpoint, Username: key.Username, Scope: SessionLockAccount})
+	return s.Lock(ctx, SessionLockKey{
+		Endpoint: normalizedAuthEndpoint(key.Endpoint),
+		Username: strings.ToLower(strings.TrimSpace(key.Username)),
+		Scope:    SessionLockAccount,
+	})
 }
 
 // LockEntry serializes access to one endpoint, identity, and impersonation
@@ -480,8 +487,18 @@ func validateSessionRecord(key SessionKey, record *SessionRecord, now time.Time)
 	if record.CredentialFingerprint == "" || record.CredentialFingerprint != key.CredentialFingerprint {
 		return ErrSessionCacheCredentialMismatch
 	}
-	if len(record.Cookies) == 0 && record.RetryNotBefore.IsZero() {
+	if len(record.Cookies) == 0 && record.RetryNotBefore.IsZero() && record.OTPSecretBinding == "" {
 		return fmt.Errorf("%w: session has no cookies", ErrSessionCacheCorrupt)
+	}
+	if record.OTPSecretBinding != "" {
+		if len(record.OTPSecretBinding) != sha256.Size*2 || record.AcceptedOTPStep < 0 || record.AcceptedOTPStep > maxAcceptedOTPStep {
+			return fmt.Errorf("%w: invalid accepted OTP metadata", ErrSessionCacheCorrupt)
+		}
+		if _, err := hex.DecodeString(record.OTPSecretBinding); err != nil {
+			return fmt.Errorf("%w: invalid accepted OTP binding", ErrSessionCacheCorrupt)
+		}
+	} else if record.AcceptedOTPStep != 0 {
+		return fmt.Errorf("%w: OTP step has no secret binding", ErrSessionCacheCorrupt)
 	}
 	for _, cookie := range record.Cookies {
 		if err := validateSessionCookie(cookie, now); err != nil {

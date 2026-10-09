@@ -32,8 +32,9 @@ type Config struct {
 	// SessionCacheDir enables local, private session reuse when nonempty.
 	// It coordinates only processes sharing this directory on one host.
 	SessionCacheDir string
-	// OnAuthEvent receives bounded authentication lifecycle events. It is
-	// installed before New sends its first handshake request.
+	// OnAuthEvent receives bounded authentication lifecycle and individual
+	// login/OTP request-attempt events. It is installed before New sends its
+	// first handshake request.
 	OnAuthEvent AuthEventHandler
 }
 

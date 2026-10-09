@@ -43,6 +43,15 @@ and impersonation succeed, then replays the request at most once:
   four handshakes; credentials rejected at login are not retried. An OTP
   rejection can wait for one new TOTP window, because rejection alone does not
   establish whether the code was replayed or the clocks differ.
+- After the server accepts an OTP, the SDK remembers the TOTP step against the
+  normalized endpoint, authenticating username, and a one-way OTP-secret
+  binding. A later necessary handshake for that account skips a known-spent
+  step before sending the password-stage request. Valid cached sessions are
+  still reused first. Independent clients in one process coordinate this state;
+  with `SessionCacheDir`, it also survives restarts for processes sharing that
+  private directory. Password rotation and impersonation-target changes do not
+  reset it; rotating the OTP secret does. This is local coordination only, not a
+  quota or a guarantee against use from another host/cache directory.
 - A refresh cycle that ends in error is remembered for a 30s cooldown: further
   session-loss responses at the same generation fail fast with the remembered
   error instead of starting another full handshake cycle. A refresh that sees a
@@ -69,10 +78,17 @@ session 401s until restart" behaviour.
 `impersonation`, or `session_recovery`), kind, wrapped cause, and server retry
 timing. Its message omits credentials, cookies, OTP values, and server bodies;
 `errors.As(err, &apiErr)` still exposes the underlying `APIError` when needed.
+Accepted-OTP coordination failures are discoverable with
+`errors.Is(err, ErrOTPStateStorage)`.
 Set `Config.OnAuthEvent` before calling `New` to observe bounded handshake,
-recovery, cooldown, and rate-limit events, including the initial handshake.
-Callbacks can run concurrently and should return quickly. Their stage,
-reason, and outcome fields are safe for low-cardinality metrics.
+recovery, cooldown, rate-limit, and request-attempt events, including the
+initial handshake. Each attempted login and OTP request emits one
+`attempt_result` event with its stage, bounded reason/outcome, and HTTP status
+(`0` when no response was obtained). A successful login-stage attempt is not a
+fully authenticated session; use the handshake result for that distinction.
+Preemptive waits and cache hits send no request and emit no attempt result.
+Callbacks can run concurrently and should return quickly. Events contain no
+endpoint, account identifier, credential, OTP, cookie, or response body.
 
 ## Optional local session cache
 
@@ -90,6 +106,11 @@ An account-level OS lock serializes authentication across impersonation
 targets, and server retry deadlines apply to that account across targets.
 Session cookies and ineffective-recovery cooldowns remain target-specific;
 an unusable cached generation is invalidated until its cooldown expires.
+Accepted OTP-step metadata is account-level and separate from bearer cookies.
+Its OTP-specific data contains only the accepted TOTP step and a one-way
+OTP-secret binding; a metadata read/write or validation error fails
+authentication rather than silently allowing a known replay. No production
+attempt quota is imposed.
 Processes must share the same
 local directory for this to coordinate them. It cannot prevent OTP collisions
 with browsers, other hosts, or independently configured controllers. Controller

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -46,10 +47,11 @@ func TestImpersonationClosureUsesFreshSession(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client, err := New(context.Background(), Config{BaseURL: server.URL + "/api/2.0/", Username: "user", Password: "pass", OTPSecret: "GEZD GNBV GY3T QOJQ", Impersonate: "target"})
+	client, err := New(context.Background(), Config{BaseURL: server.URL + "/api/2.0/", Username: t.Name(), Password: "pass", OTPSecret: "GEZD GNBV GY3T QOJQ", Impersonate: "target"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	installFastOTPClock(client.refresher.auth)
 	defer client.Close()
 	var out map[string]any
 	if err := client.Get(context.Background(), "protected/", &out); err != nil {
@@ -107,10 +109,11 @@ func TestFailedCandidateKeepsPublishedJar(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client, err := New(context.Background(), Config{BaseURL: server.URL + "/api/2.0/", Username: "user", Password: "pass", OTPSecret: "GEZD GNBV GY3T QOJQ"})
+	client, err := New(context.Background(), Config{BaseURL: server.URL + "/api/2.0/", Username: t.Name(), Password: "pass", OTPSecret: "GEZD GNBV GY3T QOJQ"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	installFastOTPClock(client.refresher.auth)
 	defer client.Close()
 	_, jar := client.refresher.snapshot()
 	if err := client.Get(context.Background(), "protected/", nil); err == nil {
@@ -132,7 +135,7 @@ func TestSessionCacheReusesCookieAndRecoversRevocation(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := Config{
-		BaseURL: f.baseURL(), Username: "user", Password: "pass",
+		BaseURL: f.baseURL(), Username: f.user, Password: "pass",
 		OTPSecret: "GEZD GNBV GY3T QOJQ", SessionCacheDir: cacheDir,
 	}
 	first, err := New(context.Background(), cfg)
@@ -144,6 +147,7 @@ func TestSessionCacheReusesCookieAndRecoversRevocation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	installFastOTPClock(second.refresher.auth)
 	defer second.Close()
 	if login, _, _ := f.counts(); login != 1 {
 		t.Fatalf("login calls after restart = %d, want 1", login)
@@ -176,10 +180,23 @@ func TestSessionCacheProcessHelper(t *testing.T) {
 	if endpoint == "" {
 		return
 	}
-	client, err := New(context.Background(), Config{
-		BaseURL: endpoint, Username: "user", Password: "pass",
-		OTPSecret: "GEZD GNBV GY3T QOJQ", SessionCacheDir: os.Getenv("CLOUDSIGMA_TEST_CACHE_DIR"),
-	})
+	username := os.Getenv("CLOUDSIGMA_TEST_CACHE_USER")
+	if username == "" {
+		username = "user"
+	}
+	start := time.Now()
+	if raw := os.Getenv("CLOUDSIGMA_TEST_CACHE_NOW"); raw != "" {
+		unix, parseErr := strconv.ParseInt(raw, 10, 64)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		start = time.Unix(unix, 0)
+	}
+	client, err := newTestClientWithClock(context.Background(), Config{
+		BaseURL: endpoint, Username: username, Password: "pass",
+		OTPSecret: "GEZD GNBV GY3T QOJQ", Impersonate: os.Getenv("CLOUDSIGMA_TEST_CACHE_TARGET"),
+		SessionCacheDir: os.Getenv("CLOUDSIGMA_TEST_CACHE_DIR"),
+	}, start)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,8 +292,8 @@ func TestSessionCacheHonorsPersistedRetryDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := SessionKey{
-		Endpoint: f.baseURL(), Username: "user", Impersonate: "target-a",
-		CredentialFingerprint: CredentialFingerprint(f.baseURL(), "user", "pass", "GEZD GNBV GY3T QOJQ"),
+		Endpoint: f.baseURL(), Username: f.user, Impersonate: "target-a",
+		CredentialFingerprint: CredentialFingerprint(f.baseURL(), f.user, "pass", "GEZD GNBV GY3T QOJQ"),
 	}
 	lock, err := store.LockAccount(context.Background(), key)
 	if err != nil {
@@ -286,7 +303,7 @@ func TestSessionCacheHonorsPersistedRetryDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = lock.Close()
-	_, err = New(context.Background(), Config{BaseURL: f.baseURL(), Username: "user", Password: "pass", OTPSecret: "GEZD GNBV GY3T QOJQ", Impersonate: "target-b", SessionCacheDir: dir})
+	_, err = New(context.Background(), Config{BaseURL: f.baseURL(), Username: f.user, Password: "pass", OTPSecret: "GEZD GNBV GY3T QOJQ", Impersonate: "target-b", SessionCacheDir: dir})
 	var authErr *AuthError
 	if !errors.As(err, &authErr) || authErr.Kind != AuthKindRateLimited {
 		t.Fatalf("New = %v, want cached rate-limit error", err)
@@ -314,7 +331,7 @@ func TestRateLimitFromOneTargetBlocksAnother(t *testing.T) {
 	}
 	newTarget := func(target string) *refresher {
 		t.Helper()
-		auth, err := newAuthenticator(server.URL+"/api/2.0/", "user", "pass", "GEZD GNBV GY3T QOJQ", target, "", time.Second)
+		auth, err := newAuthenticator(server.URL+"/api/2.0/", t.Name(), "pass", "GEZD GNBV GY3T QOJQ", target, "", time.Second)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -350,11 +367,12 @@ func TestIneffectiveRecoveryCooldownSurvivesRestart(t *testing.T) {
 	if err := os.Chmod(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	cfg := Config{BaseURL: f.baseURL(), Username: "user", Password: "pass", OTPSecret: "GEZD GNBV GY3T QOJQ", SessionCacheDir: dir}
+	cfg := Config{BaseURL: f.baseURL(), Username: f.user, Password: "pass", OTPSecret: "GEZD GNBV GY3T QOJQ", SessionCacheDir: dir}
 	client, err := New(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	installFastOTPClock(client.refresher.auth)
 	defer client.Close()
 	f.mu.Lock()
 	f.alwaysUnauthorized = true
@@ -411,10 +429,11 @@ func TestLateFailedReplayCannotCoolDownNewGeneration(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client, err := New(context.Background(), Config{BaseURL: server.URL + "/api/2.0/", Username: "user", Password: "pass", OTPSecret: "GEZD GNBV GY3T QOJQ"})
+	client, err := New(context.Background(), Config{BaseURL: server.URL + "/api/2.0/", Username: t.Name(), Password: "pass", OTPSecret: "GEZD GNBV GY3T QOJQ"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	installFastOTPClock(client.refresher.auth)
 	defer client.Close()
 	aResult := make(chan error, 1)
 	go func() { aResult <- client.Get(context.Background(), "protected/?flow=a", nil) }()
@@ -444,7 +463,7 @@ func TestIneffectiveReplayReservesGenerationWhilePersisting(t *testing.T) {
 		t.Fatal(err)
 	}
 	client, err := New(context.Background(), Config{
-		BaseURL: f.baseURL(), Username: "user", Password: "pass",
+		BaseURL: f.baseURL(), Username: f.user, Password: "pass",
 		OTPSecret: "GEZD GNBV GY3T QOJQ", SessionCacheDir: dir,
 	})
 	if err != nil {
@@ -499,7 +518,7 @@ func TestCanceledReplayDoesNotWaitForCooldownPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	client, err := New(context.Background(), Config{
-		BaseURL: f.baseURL(), Username: "user", Password: "pass",
+		BaseURL: f.baseURL(), Username: f.user, Password: "pass",
 		OTPSecret: "GEZD GNBV GY3T QOJQ", SessionCacheDir: dir,
 	})
 	if err != nil {
@@ -602,13 +621,14 @@ func TestAuthEventsIncludeInitialHandshakeAndRecovery(t *testing.T) {
 	var mu sync.Mutex
 	var events []AuthEvent
 	client, err := New(context.Background(), Config{
-		BaseURL: f.baseURL(), Username: "user", Password: "secret-password",
+		BaseURL: f.baseURL(), Username: f.user, Password: "secret-password",
 		OTPSecret:   "GEZD GNBV GY3T QOJQ",
 		OnAuthEvent: func(event AuthEvent) { mu.Lock(); events = append(events, event); mu.Unlock() },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	installFastOTPClock(client.refresher.auth)
 	defer client.Close()
 	f.expire()
 	if err := client.Get(context.Background(), "protected/", nil); err != nil {
@@ -640,7 +660,7 @@ func TestStaleCachedSessionParallelBurstRecovers(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := Config{
-		BaseURL: f.baseURL(), Username: "user", Password: "pass",
+		BaseURL: f.baseURL(), Username: f.user, Password: "pass",
 		OTPSecret: "GEZD GNBV GY3T QOJQ", SessionCacheDir: cacheDir,
 	}
 	first, err := New(context.Background(), cfg)
@@ -650,7 +670,7 @@ func TestStaleCachedSessionParallelBurstRecovers(t *testing.T) {
 	first.Close()
 	f.expire() // the cached cookie died overnight
 
-	second, err := New(context.Background(), cfg)
+	second, err := newTestClientWithFastClock(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
